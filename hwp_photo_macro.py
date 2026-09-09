@@ -289,6 +289,41 @@ class HwpController:
         self._clear_field_name(name)
         return ids
 
+    def _probe_field_count(self):
+        """이름을 붙인 직후 개수만 세어본다. 몇 칸에 붙었는지 바로 알 수 있다."""
+        name = FIELD_TAG + "_probe"
+        ok = self._set_field_name(name)
+        n = self._count_field(name)
+        self.escape_selection()
+        self._clear_field_name(name)
+        return f"SetCurFieldName 성공={ok}, 이름 붙은 칸={n}"
+
+    def block_text_probe(self):
+        """선택된 블록의 텍스트를 그대로 읽는다. 선택을 건드리지 않는다.
+
+        칸이 비어 있어도 칸마다 구분자가 들어가므로,
+        조각 개수로 한글이 몇 칸을 블록으로 보고 있는지 알 수 있다."""
+        self._require()
+        out = {}
+        for fmt, opt in (("TEXT", "saveblock:true"), ("TEXT", "saveblock"),
+                         ("HWPML2X", "saveblock:true")):
+            key = f"GetTextFile({fmt},{opt})"
+            try:
+                raw = self.hwp.GetTextFile(fmt, opt)
+            except Exception as e:
+                out[key] = f"실패: {e}"
+                continue
+            if raw is None:
+                out[key] = "None"
+                continue
+            text = str(raw)
+            if fmt == "HWPML2X":
+                out[key] = f"길이 {len(text)}, <CELL 개수 {text.count('<CELL ')}"
+            else:
+                segs = [x for x in re.split(r"\r\n|\n|\r", text)]
+                out[key] = f"길이 {len(text)}, 조각 {len(segs)}개, 앞부분 {text[:40]!r}"
+        return out
+
     def selection_mode(self):
         """0이 아니면 무언가 선택된 상태. 셀 블록도 여기에 잡힌다."""
         try:
@@ -297,23 +332,31 @@ class HwpController:
             return None
 
     def selection_probe(self, option: int = 0):
-        """선택 영역을 읽는 방법들의 결과를 그대로 모은다 (진단용)."""
+        """선택 영역을 읽는 방법들의 결과를 그대로 모은다 (진단용).
+
+        앞쪽은 선택을 건드리지 않는 검사, 뒤쪽은 선택을 소모하는 검사다."""
         self._require()
         report = {}
-        try:
-            report[f"셀필드 방식(option={option})"] = self.selected_cells(option=option)
-        except Exception as e:
-            report["셀필드 방식"] = f"실패: {e}"
+
+        # (1) 선택을 건드리지 않는 검사
+        report["SelectionMode"] = self.selection_mode()
+        report["GetPos"] = self.get_pos()
+        report["표 안 여부"] = self.in_table()
         try:
             report["GetSelectedPos"] = self.hwp.GetSelectedPos()
         except Exception as e:
             report["GetSelectedPos"] = f"실패: {e}"
         try:
-            report["SelectionMode"] = self.hwp.SelectionMode
+            report.update(self.block_text_probe())
         except Exception as e:
-            report["SelectionMode"] = f"실패: {e}"
-        report["GetPos"] = self.get_pos()
-        report["표 안 여부"] = self.in_table()
+            report["블록 텍스트"] = f"실패: {e}"
+
+        # (2) 여기서부터는 선택이 사라진다
+        try:
+            report["필드 붙인 결과"] = self._probe_field_count()
+        except Exception as e:
+            report["필드 붙인 결과"] = f"실패: {e}"
+
         report["열린 문서"] = self.documents()
         return report
 
