@@ -478,6 +478,7 @@ class App(tk.Tk):
         self._build_ui()
         self._bind_keys()
         self._start_hotkeys()
+        self._toggle_place()
         self._refresh()
         self.log("프로그램을 시작했습니다.")
         if Image is None:
@@ -567,12 +568,28 @@ class App(tk.Tk):
         right.pack(side="left", fill="y", padx=(10, 0))
         right.pack_propagate(False)
 
-        form = ttk.LabelFrame(right, text="표 구조", padding=8)
-        form.pack(fill="x")
+        place = ttk.LabelFrame(right, text="삽입 방식", padding=8)
+        place.pack(fill="x")
+        self.var_place = tk.StringVar(value="manual")
+        ttk.Radiobutton(place, text="선택한 칸에만 넣기", value="manual",
+                        variable=self.var_place, command=self._toggle_place)\
+            .grid(row=0, column=0, sticky="w")
+        ttk.Label(place, text="커서가 있는 칸에 한 장 넣고 멈춥니다",
+                  foreground="#666", wraplength=230).grid(row=1, column=0, sticky="w", padx=18)
+        ttk.Radiobutton(place, text="자동으로 이어서 넣기", value="auto",
+                        variable=self.var_place, command=self._toggle_place)\
+            .grid(row=2, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(place, text="표를 훑어 사진 칸을 찾아 이동합니다",
+                  foreground="#666", wraplength=230).grid(row=3, column=0, sticky="w", padx=18)
+
+        form = ttk.LabelFrame(right, text="표 구조 (자동 모드)", padding=8)
+        form.pack(fill="x", pady=(8, 0))
+        self._auto_only = []
         self.var_mode = tk.StringVar(value="auto")
-        ttk.Radiobutton(form, text="자동 감지 (권장)", value="auto",
-                        variable=self.var_mode, command=self._toggle_mode)\
-            .grid(row=0, column=0, columnspan=2, sticky="w")
+        rb_auto = ttk.Radiobutton(form, text="자동 감지 (권장)", value="auto",
+                                  variable=self.var_mode, command=self._toggle_mode)
+        rb_auto.grid(row=0, column=0, columnspan=2, sticky="w")
+        self._auto_only.append(rb_auto)
         ttk.Label(form, text="큰 칸=사진, 작은 칸=캡션",
                   foreground="#666").grid(row=1, column=0, columnspan=2, sticky="w", padx=18)
         ttk.Label(form, text="사진 칸 최소 높이(mm)").grid(row=2, column=0, sticky="w",
@@ -584,16 +601,19 @@ class App(tk.Tk):
         self.sp_min_h.grid(row=2, column=1, sticky="e", pady=(4, 0))
         ttk.Label(form, text="0 = 자동 계산", foreground="#666")\
             .grid(row=3, column=0, columnspan=2, sticky="w", padx=18)
-        ttk.Radiobutton(form, text="모든 칸에 사진 넣기", value="all",
-                        variable=self.var_mode, command=self._toggle_mode)\
-            .grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        rb_all = ttk.Radiobutton(form, text="모든 칸에 사진 넣기", value="all",
+                                 variable=self.var_mode, command=self._toggle_mode)
+        rb_all.grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self._auto_only.append(rb_all)
 
-        self.var_caption_on = tk.BooleanVar(value=True)
-        ttk.Checkbutton(form, text="캡션 자동 입력", variable=self.var_caption_on)\
-            .grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.var_caption_on = tk.BooleanVar(value=False)
+        cb_cap = ttk.Checkbutton(form, text="캡션 자동 입력", variable=self.var_caption_on)
+        cb_cap.grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
         self.var_auto_caption = tk.BooleanVar(value=False)
-        ttk.Checkbutton(form, text="캡션 비면 파일명 사용", variable=self.var_auto_caption)\
-            .grid(row=6, column=0, columnspan=2, sticky="w")
+        cb_cap2 = ttk.Checkbutton(form, text="캡션 비면 파일명 사용",
+                                  variable=self.var_auto_caption)
+        cb_cap2.grid(row=6, column=0, columnspan=2, sticky="w")
+        self._auto_only += [cb_cap, cb_cap2]
 
         opt = ttk.LabelFrame(right, text="여백 주기 (px)", padding=8)
         opt.pack(fill="x", pady=8)
@@ -651,7 +671,19 @@ class App(tk.Tk):
         self._toggle_mode()
 
     def _toggle_mode(self):
-        self.sp_min_h.configure(state="normal" if self.var_mode.get() == "auto" else "disabled")
+        auto = self.var_place.get() == "auto" and self.var_mode.get() == "auto"
+        self.sp_min_h.configure(state="normal" if auto else "disabled")
+        self._invalidate_plan()
+
+    def _toggle_place(self):
+        """선택한 칸 모드에서는 표 구조 감지 설정이 필요 없다."""
+        manual = self.var_place.get() == "manual"
+        for w in self._auto_only:
+            try:
+                w.configure(state="disabled" if manual else "normal")
+            except Exception:
+                pass
+        self._toggle_mode()
         self._invalidate_plan()
 
     def _invalidate_plan(self):
@@ -1060,7 +1092,8 @@ class App(tk.Tk):
         if not self._ready():
             return
         margins, border = self._insert_options()
-        thr = self._threshold()
+        manual = self.var_place.get() == "manual"
+        thr = None if manual else self._threshold()
         item = self.photos[self.cursor]
         cell, pic, pos = self.ctrl.insert_picture_fit(
             item["path"], margins, border, post_adjust=self.var_post_adjust.get())
@@ -1068,15 +1101,27 @@ class App(tk.Tk):
         self.log(f"삽입: {os.path.basename(item['path'])} — "
                  f"칸 {self._mm(cell)}, 사진 {self._mm(pic)}")
         self.log(f"  커서 {pos[0]} → {pos[1]}")
-        moved = self._advance(thr, self._caption_for(item))
-        self.log(f"  다음 사진 칸으로 이동: {'성공' if moved else '실패'} "
-                 f"(현재 {self.ctrl.get_pos()})")
+        if manual:
+            self.log("  선택한 칸 모드 — 다음 사진을 넣을 칸을 직접 클릭해 주세요.")
+        else:
+            moved = self._advance(thr, self._caption_for(item))
+            self.log(f"  다음 사진 칸으로 이동: {'성공' if moved else '실패'} "
+                     f"(현재 {self.ctrl.get_pos()})")
         self._refresh()
 
     @guarded
     def on_insert_all(self):
         if not self._ready():
             return
+        if self.var_place.get() == "manual":
+            messagebox.showinfo(
+                "선택한 칸 모드입니다",
+                "지금은 커서가 있는 칸에만 한 장씩 넣는 방식입니다.\n\n"
+                "[한 장 넣기] 또는 Ctrl+Q 를 쓰시거나,\n"
+                "여러 장을 이어서 넣으려면 삽입 방식을\n"
+                "[자동으로 이어서 넣기] 로 바꿔주세요.", parent=self)
+            return
+
         margins, border = self._insert_options()
         thr, available = self._plan()
         self._thr_cache = thr
