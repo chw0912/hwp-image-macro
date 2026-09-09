@@ -134,26 +134,69 @@ class HwpController:
         if self.hwp is None:
             raise HwpError("한글에 연결되어 있지 않습니다. [한글 연결]을 먼저 눌러주세요.")
 
+    def selection_probe(self):
+        """선택 영역을 읽는 여러 방법을 모두 시도하고 결과를 그대로 돌려준다.
+
+        한글 버전에 따라 어느 것이 셀 블록을 알려주는지 달라서,
+        진단용으로 전부 시도한 결과를 남긴다."""
+        self._require()
+        report = {}
+
+        try:
+            report["GetSelectedPos"] = self.hwp.GetSelectedPos()
+        except Exception as e:
+            report["GetSelectedPos"] = f"실패: {e}"
+
+        try:
+            sset = self.hwp.CreateSet("ListParaPos")
+            eset = self.hwp.CreateSet("ListParaPos")
+            ok = self.hwp.GetSelectedPosBySet(sset, eset)
+            report["GetSelectedPosBySet"] = (
+                ok,
+                (sset.Item("List"), sset.Item("Para"), sset.Item("Pos")),
+                (eset.Item("List"), eset.Item("Para"), eset.Item("Pos")),
+            )
+        except Exception as e:
+            report["GetSelectedPosBySet"] = f"실패: {e}"
+
+        try:
+            report["SelectionMode"] = self.hwp.SelectionMode
+        except Exception as e:
+            report["SelectionMode"] = f"실패: {e}"
+
+        report["GetPos"] = self.get_pos()
+        report["표 안 여부"] = self.in_table()
+        return report
+
+    def _selection_range(self):
+        """선택 영역의 (시작 list, 끝 list). 못 읽으면 None."""
+        # 1) GetSelectedPos
+        try:
+            res = self.hwp.GetSelectedPos()
+            if res and res[0]:
+                return int(res[1]), int(res[4])
+        except Exception:
+            pass
+        # 2) GetSelectedPosBySet — 셀 블록은 이쪽만 알려주는 경우가 있다
+        try:
+            sset = self.hwp.CreateSet("ListParaPos")
+            eset = self.hwp.CreateSet("ListParaPos")
+            if self.hwp.GetSelectedPosBySet(sset, eset):
+                return int(sset.Item("List")), int(eset.Item("List"))
+        except Exception:
+            pass
+        return None
+
     def selected_cells(self):
         """셀 블록으로 선택된 칸들의 list 번호를 순서대로 돌려준다.
 
         한글은 표의 칸마다 별도의 list 번호를 매기고, 그 번호는
-        왼쪽 위에서 오른쪽 아래로 순서대로 붙는다.
-        GetSelectedPos() 로 선택 범위의 시작/끝 list 를 얻어
-        그 사이에서 실제로 칸인 것만 추린다."""
+        왼쪽 위에서 오른쪽 아래로 순서대로 붙는다."""
         self._require()
-        try:
-            res = self.hwp.GetSelectedPos()
-        except Exception:
+        rng = self._selection_range()
+        if rng is None:
             return []
-        if not res or not res[0]:
-            return []
-        try:
-            _, slist, _spara, _spos, elist, _epara, _epos = res
-        except (ValueError, TypeError):
-            return []
-
-        slist, elist = int(slist), int(elist)
+        slist, elist = rng
         if elist < slist:
             slist, elist = elist, slist
         if elist - slist > MAX_CELL_WALK:
@@ -1162,9 +1205,11 @@ class App(tk.Tk):
         if not cells:
             messagebox.showinfo(
                 "칸을 선택해 주세요",
-                "한글 문서에서 사진을 넣을 칸들을 드래그로 선택한 뒤\n"
-                "다시 [한번에 넣기] 를 눌러주세요.\n\n"
-                "한 칸씩 넣으시려면 [한 장 넣기] 또는 Ctrl+Q 를 쓰시면 됩니다.",
+                "선택된 칸을 찾지 못했습니다.\n\n"
+                "한글 창을 보고 있는 상태에서 칸들을 드래그로 선택한 뒤\n"
+                "Ctrl+Shift+A 를 눌러주세요.\n"
+                "프로그램 창을 클릭하면 선택이 풀리는 경우가 있습니다.\n\n"
+                "한 칸씩 넣으시려면 Ctrl+Q 를 쓰시면 됩니다.",
                 parent=self)
             return
 
@@ -1205,12 +1250,17 @@ class App(tk.Tk):
             messagebox.showinfo("안내", "먼저 [한글 연결]을 눌러주세요.", parent=self)
             return
         cells = self.ctrl.selected_cells()
-        self.log(f"선택 영역 확인: 칸 {len(cells)}개 {cells[:20]}")
+        probe = self.ctrl.selection_probe()
+        detail = "\n".join(f"{k} : {v}" for k, v in probe.items())
+        self.log(f"선택 영역 확인: 칸 {len(cells)}개 {cells[:20]}\n{detail}")
         if not cells:
             messagebox.showinfo(
                 "선택 영역 확인",
                 "선택된 칸을 찾지 못했습니다.\n\n"
-                "한글에서 칸들을 드래그로 선택한 뒤 다시 눌러주세요.", parent=self)
+                "한글 창을 보고 있는 상태에서 칸을 드래그로 선택한 뒤\n"
+                "Ctrl+Shift+A 를 눌러보세요. 프로그램 창을 클릭하면\n"
+                "선택이 풀리는 경우가 있습니다.\n\n"
+                "--- 진단 ---\n" + detail, parent=self)
             return
         messagebox.showinfo(
             "선택 영역 확인",
