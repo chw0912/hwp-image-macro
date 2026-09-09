@@ -191,13 +191,30 @@ class HwpController:
         except Exception:
             pass
 
-    def cell_size(self):
-        """현재 칸의 (안쪽 너비, 안쪽 높이) HWPUNIT. 표 밖이면 None."""
-        self._require()
+    def _cell_param(self):
+        """셀 속성 ParameterSet 을 돌려준다.
+
+        공식 매뉴얼: CellShape 는 ParameterSet/Table 로 표의 속성이고,
+        그 안의 "Cell" 아이템이 ParameterSet/Cell 로 셀의 속성이다.
+        CellShape 를 바로 읽으면 표 크기를 셀 크기로 착각하게 된다."""
         try:
             cs = self.hwp.CellShape
         except Exception:
             return None
+        if cs is None:
+            return None
+        try:
+            sub = cs.Item("Cell")
+            if sub is not None:
+                return sub
+        except Exception:
+            pass
+        return cs
+
+    def cell_size(self):
+        """현재 칸의 (안쪽 너비, 안쪽 높이) HWPUNIT. 표 밖이면 None."""
+        self._require()
+        cs = self._cell_param()
         if cs is None:
             return None
 
@@ -214,6 +231,42 @@ class HwpController:
         w -= item("MarginLeft") + item("MarginRight")
         h -= item("MarginTop") + item("MarginBottom")
         return max(w, 1), max(h, 1)
+
+    def cell_size_probe(self):
+        """셀 크기를 어디서 어떻게 읽고 있는지 그대로 보여준다 (진단용)."""
+        self._require()
+        out = {}
+        try:
+            cs = self.hwp.CellShape
+        except Exception as e:
+            return {"CellShape": f"실패: {e}"}
+        keys = ("Width", "Height", "MarginLeft", "MarginRight",
+                "MarginTop", "MarginBottom")
+
+        def dump(pset, label):
+            vals = {}
+            for k in keys:
+                try:
+                    v = pset.Item(k)
+                    vals[k] = None if v is None else int(v)
+                except Exception:
+                    vals[k] = "-"
+            out[label] = vals
+
+        dump(cs, "CellShape 직접(표 속성)")
+        try:
+            sub = cs.Item("Cell")
+            if sub is not None:
+                dump(sub, "CellShape.Item('Cell') (셀 속성)")
+            else:
+                out["CellShape.Item('Cell')"] = "None"
+        except Exception as e:
+            out["CellShape.Item('Cell')"] = f"실패: {e}"
+        size = self.cell_size()
+        if size:
+            out["실제 사용값"] = (f"{size[0]}x{size[1]} HWPUNIT = "
+                             f"{size[0] / HWPUNIT_PER_MM:.1f}x{size[1] / HWPUNIT_PER_MM:.1f}mm")
+        return out
 
     def in_table(self) -> bool:
         return self.cell_size() is not None
@@ -484,9 +537,13 @@ class HwpController:
             return 4, 3
 
     def insert_picture_fit(self, path: str, margins_px=(0, 0, 0, 0),
-                           border_px=0, post_adjust: bool = False):
-        """현재 칸 크기에 맞춰 비율을 유지한 채 삽입.
-        margins_px = (상, 하, 좌, 우) 픽셀"""
+                           border_px=0, post_adjust: bool = False,
+                           keep_ratio: bool = False):
+        """칸 크기에 맞춰 삽입. margins_px = (상, 하, 좌, 우) 픽셀
+
+        keep_ratio=True  : 비율을 유지해 칸에 들어가는 최대 크기.
+                           세로로 긴 사진은 좌우에 공백이 남는다.
+        keep_ratio=False : 비율을 무시하고 칸을 꽉 채운다. 사진이 늘어난다."""
         self._require()
         if not os.path.exists(path):
             raise HwpError(f"사진 파일을 찾을 수 없습니다.\n{path}")
@@ -500,10 +557,13 @@ class HwpController:
         avail_w = max(cw - left - right, 1)
         avail_h = max(ch - top - bottom, 1)
 
-        iw, ih = self._image_ratio(path)
-        scale = min(avail_w / iw, avail_h / ih)
-        w = max(int(iw * scale), 1)
-        h = max(int(ih * scale), 1)
+        if keep_ratio:
+            iw, ih = self._image_ratio(path)
+            scale = min(avail_w / iw, avail_h / ih)
+            w = max(int(iw * scale), 1)
+            h = max(int(ih * scale), 1)
+        else:
+            w, h = avail_w, avail_h
 
         hwp = self.hwp
         hwp.Run("ParagraphShapeAlignCenter")
@@ -716,6 +776,13 @@ class App(tk.Tk):
         self.var_border_px = tk.IntVar(value=1)
         ttk.Spinbox(bd, from_=1, to=20, increment=1, width=6,
                     textvariable=self.var_border_px).grid(row=0, column=1, sticky="e")
+        self.var_keep_ratio = tk.BooleanVar(value=False)
+        ttk.Checkbutton(bd, text="비율 유지 (여백 생김)", variable=self.var_keep_ratio)\
+            .grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Label(bd, text="끄면 칸을 꽉 채웁니다. 사진이 늘어날 수 있습니다.",
+                  foreground="#666", wraplength=225)\
+            .grid(row=4, column=0, columnspan=2, sticky="w")
+
         self.var_post_adjust = tk.BooleanVar(value=False)
         ttk.Checkbutton(bd, text="삽입 후 크기 다시 지정",
                         variable=self.var_post_adjust)\
@@ -738,6 +805,8 @@ class App(tk.Tk):
                    command=self.on_check_selection).pack(fill="x", pady=2)
         ttk.Button(diag, text="커서 위치 확인",
                    command=self.on_check_cursor).pack(fill="x", pady=2)
+        ttk.Button(diag, text="칸 크기 확인",
+                   command=self.on_check_cell).pack(fill="x", pady=2)
 
     # ---------------- 선택 영역 감시 ----------------
     def _refresh(self):
@@ -953,7 +1022,8 @@ class App(tk.Tk):
         margins, border = self._insert_options()
         path = self.photos[self.cursor]
         cell, pic = self.ctrl.insert_picture_fit(
-            path, margins, border, post_adjust=self.var_post_adjust.get())
+            path, margins, border, post_adjust=self.var_post_adjust.get(),
+                keep_ratio=self.var_keep_ratio.get())
         self.cursor += 1
         self.log(f"삽입: {os.path.basename(path)} — 칸 {self._mm(cell)}, 사진 {self._mm(pic)}")
         self._refresh()
@@ -1005,7 +1075,8 @@ class App(tk.Tk):
                 continue
             path = self.photos[self.cursor]
             cell, pic = self.ctrl.insert_picture_fit(
-                path, margins, border, post_adjust=self.var_post_adjust.get())
+                path, margins, border, post_adjust=self.var_post_adjust.get(),
+                keep_ratio=self.var_keep_ratio.get())
             self.cursor += 1
             inserted += 1
             self.log(f"삽입 {inserted}: {os.path.basename(path)} — "
@@ -1023,6 +1094,17 @@ class App(tk.Tk):
         detail = "\n".join(f"{k} : {v}" for k, v in probe.items())
         self.log("선택 영역 확인\n" + detail)
         messagebox.showinfo("선택 영역 확인", detail, parent=self)
+
+    @guarded
+    def on_check_cell(self):
+        """사진이 칸을 넘치면 크기를 어디서 읽고 있는지 확인한다."""
+        if not self.ctrl.connected:
+            messagebox.showinfo("안내", "먼저 [한글 연결]을 눌러주세요.", parent=self)
+            return
+        probe = self.ctrl.cell_size_probe()
+        detail = "\n".join(f"{k} : {v}" for k, v in probe.items())
+        self.log("칸 크기 확인\n" + detail)
+        messagebox.showinfo("칸 크기 확인", detail, parent=self)
 
     @guarded
     def on_check_cursor(self):
