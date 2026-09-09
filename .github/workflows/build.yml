@@ -1,0 +1,79 @@
+name: build-release
+
+# v 로 시작하는 태그를 푸시하면 Windows 에서 빌드하고 릴리즈에 첨부한다.
+#   git tag v1.0.0
+#   git push origin v1.0.0
+#
+# Actions 탭에서 [Run workflow] 로 직접 실행하면
+# 릴리즈 없이 빌드 결과물만 받아볼 수도 있다. (테스트용)
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: 소스 받기
+        uses: actions/checkout@v4
+
+      - name: 파이썬 설치
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 의존성 설치
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: exe 빌드
+        run: |
+          pyinstaller --onefile --windowed `
+            --name hwp_image_macro `
+            --hidden-import win32timezone `
+            --clean `
+            hwp_photo_macro.py
+
+      - name: 배포용 zip 묶기
+        run: |
+          New-Item -ItemType Directory -Force -Path package | Out-Null
+          Copy-Item dist\hwp_image_macro.exe package\
+          Copy-Item 사용법.txt package\ -ErrorAction SilentlyContinue
+          Compress-Archive -Path package\* -DestinationPath hwp_image_macro.zip -Force
+
+      - name: 빌드 결과물 보관 (테스트 실행용)
+        uses: actions/upload-artifact@v4
+        with:
+          name: hwp_image_macro
+          path: |
+            dist/hwp_image_macro.exe
+            hwp_image_macro.zip
+
+      - name: 릴리즈에 첨부
+        if: startsWith(.github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/hwp_image_macro.exe
+            hwp_image_macro.zip
+          body: |
+            ## 다운로드
+
+            **hwp_image_macro.zip** 을 받아 압축을 풀고
+            `hwp_image_macro.exe` 를 실행하세요. 설치 과정은 없습니다.
+
+            ## 사용 전 확인
+
+            - **Windows + 한글(HWP) 설치**가 필요합니다. Mac 에서는 동작하지 않습니다.
+            - 처음 실행할 때 "Windows의 PC 보호" 창이 뜨면
+              **추가 정보 → 실행** 을 누르세요. 코드 서명이 없어서 뜨는 안내입니다.
+            - 사진을 넣을 때 확인 창이 반복해서 뜨면
+              동봉된 `사용법.txt` 의 **보안 모듈 등록** 항목을 참고하세요.

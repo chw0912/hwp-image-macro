@@ -12,7 +12,8 @@
 
 ### 방법 A. 실행파일로 쓰기 (권장)
 
-[Releases](../../releases) 에서 `사진대지매크로.exe` 를 내려받아 실행합니다.
+[Releases](../../releases/latest) 에서 `hwp_image_macro.zip` 을 내려받아
+압축을 풀고 `hwp_image_macro.exe` 를 실행합니다.
 파이썬 설치가 필요 없습니다.
 
 > 처음 실행할 때 "Windows의 PC 보호" 경고가 뜰 수 있습니다.
@@ -125,10 +126,24 @@ python hwp_photo_macro.py
 
 ---
 
-## 6. 직접 빌드하기
+## 6. 빌드 / 배포
+
+### 자동 (GitHub Actions)
+
+태그를 푸시하면 GitHub 의 Windows 환경에서 자동으로 빌드하고
+릴리즈에 exe 와 zip 을 첨부합니다. 로컬에 Windows 가 없어도 됩니다.
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+Actions 탭에서 진행 상황을 볼 수 있고, 3~5분 뒤 Releases 에 올라옵니다.
+
+### 수동 (Windows 에서)
 
 ```bash
 build.bat
 ```
 
-`dist\사진대지매크로.exe` 가 만들어집니다.
+`dist\hwp_image_macro.exe` 가 만들어집니다.
