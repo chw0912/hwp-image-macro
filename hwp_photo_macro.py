@@ -32,6 +32,8 @@ except ImportError:
 
 # 한글 내부 단위: 1mm = 283.465 HWPUNIT
 HWPUNIT_PER_MM = 283.465
+# 화면 기준 96dpi: 1inch = 7200 HWPUNIT = 96px 이므로 1px = 75 HWPUNIT
+HWPUNIT_PER_PX = 75
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tif", ".tiff", ".webp")
 MAX_CELL_WALK = 400
 
@@ -227,8 +229,8 @@ class HwpController:
         except Exception:
             return 4, 3
 
-    def insert_picture_fit(self, path: str, margins_mm=(0, 0, 0, 0), border_mm=0.0):
-        """현재 칸 크기에 맞춰 비율을 유지한 채 삽입. margins_mm = (상, 하, 좌, 우)"""
+    def insert_picture_fit(self, path: str, margins_px=(0, 0, 0, 0), border_px=0.0):
+        """현재 칸 크기에 맞춰 비율을 유지한 채 삽입. margins_px = (상, 하, 좌, 우) 픽셀"""
         self._require()
         if not os.path.exists(path):
             raise HwpError(f"사진 파일을 찾을 수 없습니다.\n{path}")
@@ -238,7 +240,7 @@ class HwpController:
                            "한글 문서에서 사진을 넣을 칸을 클릭한 뒤 다시 시도해 주세요.")
 
         cw, ch = size
-        top, bottom, left, right = (int(m * HWPUNIT_PER_MM) for m in margins_mm)
+        top, bottom, left, right = (int(m * HWPUNIT_PER_PX) for m in margins_px)
         avail_w = max(cw - left - right, 1)
         avail_h = max(ch - top - bottom, 1)
 
@@ -253,9 +255,9 @@ class HwpController:
             hwp.InsertPicture(path, True, 2, False, False, 0, w, h)
         except Exception:
             hwp.InsertPicture(path, True)
-        self._apply_shape(w, h, border_mm)
+        self._apply_shape(w, h, border_px)
 
-    def _apply_shape(self, w: int, h: int, border_mm: float):
+    def _apply_shape(self, w: int, h: int, border_px: float):
         hwp = self.hwp
         try:
             hwp.FindCtrl()
@@ -264,11 +266,11 @@ class HwpController:
             so.Width = w
             so.Height = h
             so.TreatAsChar = 1
-            if border_mm > 0:
+            if border_px > 0:
                 try:
                     so.LineShape.Type = 1
                     so.LineShape.Color = 0
-                    so.LineShape.Width = int(border_mm * HWPUNIT_PER_MM)
+                    so.LineShape.Width = max(int(border_px * HWPUNIT_PER_PX), 1)
                 except Exception:
                     pass
             hwp.HAction.Execute("ShapeObjDialog", so.HSet)
@@ -482,24 +484,24 @@ class App(tk.Tk):
         ttk.Checkbutton(form, text="캡션 비면 파일명 사용", variable=self.var_auto_caption)\
             .grid(row=6, column=0, columnspan=2, sticky="w")
 
-        opt = ttk.LabelFrame(right, text="여백 (mm)", padding=8)
+        opt = ttk.LabelFrame(right, text="여백 주기 (px)", padding=8)
         opt.pack(fill="x", pady=8)
         self.var_margin = {}
         for i, key in enumerate(("상", "하", "좌", "우")):
             ttk.Label(opt, text=key).grid(row=i, column=0, sticky="w", pady=1)
-            v = tk.DoubleVar(value=1.0)
+            v = tk.IntVar(value=0)
             self.var_margin[key] = v
-            ttk.Spinbox(opt, from_=0, to=30, increment=0.5, width=8, textvariable=v)\
+            ttk.Spinbox(opt, from_=0, to=300, increment=1, width=8, textvariable=v)\
                 .grid(row=i, column=1, sticky="e")
 
         bd = ttk.LabelFrame(right, text="테두리", padding=8)
         bd.pack(fill="x")
         self.var_border_on = tk.BooleanVar(value=False)
-        ttk.Checkbutton(bd, text="사진 테두리", variable=self.var_border_on)\
+        ttk.Checkbutton(bd, text="사진 테두리 (px)", variable=self.var_border_on)\
             .grid(row=0, column=0, sticky="w")
-        self.var_border_mm = tk.DoubleVar(value=0.2)
-        ttk.Spinbox(bd, from_=0.1, to=3.0, increment=0.1, width=6,
-                    textvariable=self.var_border_mm).grid(row=0, column=1, sticky="e")
+        self.var_border_px = tk.IntVar(value=1)
+        ttk.Spinbox(bd, from_=1, to=20, increment=1, width=6,
+                    textvariable=self.var_border_px).grid(row=0, column=1, sticky="e")
 
         act = ttk.Frame(right)
         act.pack(fill="x", pady=12)
@@ -727,10 +729,15 @@ class App(tk.Tk):
         self._update_status()
         self.log(f"현재 문서: {self.ctrl.doc_name()}")
 
-    def _options(self):
+    def _insert_options(self):
+        """삽입 옵션(여백/테두리)을 픽셀 단위로 돌려준다.
+
+        주의: 이 메서드 이름을 _options 로 두면 안 된다.
+        tkinter.Misc._options 를 가려버려서 파일 대화상자와 메시지 창이
+        전부 TypeError 로 죽는다."""
         m = self.var_margin
         margins = (m["상"].get(), m["하"].get(), m["좌"].get(), m["우"].get())
-        border = self.var_border_mm.get() if self.var_border_on.get() else 0.0
+        border = self.var_border_px.get() if self.var_border_on.get() else 0
         return margins, border
 
     def _plan(self):
@@ -822,7 +829,7 @@ class App(tk.Tk):
     def on_insert_one(self):
         if not self._ready():
             return
-        margins, border = self._options()
+        margins, border = self._insert_options()
         thr, _ = self._plan()
         item = self.photos[self.cursor]
         self.ctrl.insert_picture_fit(item["path"], margins, border)
@@ -835,7 +842,7 @@ class App(tk.Tk):
     def on_insert_all(self):
         if not self._ready():
             return
-        margins, border = self._options()
+        margins, border = self._insert_options()
         thr, available = self._plan()
         remaining = len(self.photos) - self.cursor
         if available < remaining:
