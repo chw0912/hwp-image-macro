@@ -226,8 +226,12 @@ class HwpController:
         return self.set_pos((list_id, 0, 0)) and self.cell_size() is not None
 
     # ---------------- 선택 영역 읽기 ----------------
-    def _set_field_name(self, name: str) -> bool:
-        for args in ((name, 0, "", ""), (name,)):
+    def _set_field_name(self, name: str, option: int = 0) -> bool:
+        """현재 위치(또는 셀 블록 전체)에 셀필드 이름을 붙인다.
+
+        option 값이 셀 블록 전체에 적용할지 현재 칸만 적용할지를
+        가르는 것으로 보인다. 환경마다 다를 수 있어 밖에서 지정한다."""
+        for args in ((name, option, "", ""), (name, option), (name,)):
             try:
                 self.hwp.SetCurFieldName(*args)
                 return True
@@ -262,7 +266,7 @@ class HwpController:
             if not self._set_field_name(""):
                 break
 
-    def selected_cells(self, name: str = FIELD_TAG):
+    def selected_cells(self, name: str = FIELD_TAG, option: int = 0):
         """드래그로 선택한 칸들의 번호를 순서대로 돌려준다.
 
         셀 블록 상태에서 SetCurFieldName 을 실행하면 선택된 모든 칸에
@@ -270,7 +274,7 @@ class HwpController:
         이름은 지운다. 범위를 추측하지 않으므로 세로 선택이나
         떨어진 선택도 그대로 처리된다."""
         self._require()
-        if not self._set_field_name(name):
+        if not self._set_field_name(name, option):
             return []
         count = self._count_field(name)
         if count == 0:
@@ -284,12 +288,12 @@ class HwpController:
         self._clear_field_name(name)
         return ids
 
-    def selection_probe(self):
+    def selection_probe(self, option: int = 0):
         """선택 영역을 읽는 방법들의 결과를 그대로 모은다 (진단용)."""
         self._require()
         report = {}
         try:
-            report["셀필드 방식"] = self.selected_cells()
+            report[f"셀필드 방식(option={option})"] = self.selected_cells(option=option)
         except Exception as e:
             report["셀필드 방식"] = f"실패: {e}"
         try:
@@ -603,6 +607,14 @@ class App(tk.Tk):
 
         diag = ttk.LabelFrame(right, text="진단", padding=8)
         diag.pack(fill="x", pady=(8, 0))
+        row = ttk.Frame(diag)
+        row.pack(fill="x")
+        ttk.Label(row, text="셀필드 option").pack(side="left")
+        self.var_field_option = tk.IntVar(value=0)
+        ttk.Spinbox(row, from_=0, to=7, increment=1, width=5,
+                    textvariable=self.var_field_option).pack(side="right")
+        ttk.Label(diag, text="선택한 칸이 1개로만 잡히면 0→1→2→3 으로 바꿔가며 시험",
+                  foreground="#666", wraplength=225).pack(anchor="w", pady=(2, 4))
         ttk.Button(diag, text="선택 영역 확인",
                    command=self.on_check_selection).pack(fill="x", pady=2)
         ttk.Button(diag, text="커서 위치 확인",
@@ -850,7 +862,7 @@ class App(tk.Tk):
         """한글에서 드래그로 선택한 칸들에 목록 순서대로 넣는다."""
         if not self._ready():
             return
-        cells = self.ctrl.selected_cells()
+        cells = self.ctrl.selected_cells(option=self.var_field_option.get())
         if not cells:
             messagebox.showinfo(
                 "칸을 선택해 주세요",
@@ -863,7 +875,20 @@ class App(tk.Tk):
 
         remaining = len(self.photos) - self.cursor
         count = min(len(cells), remaining)
-        self.log(f"선택한 칸 {len(cells)}개, 넣을 사진 {remaining}장 → {count}장 삽입")
+        self.log(f"선택한 칸 {len(cells)}개(option={self.var_field_option.get()}), "
+                 f"넣을 사진 {remaining}장 → {count}장 삽입")
+
+        if len(cells) == 1 and remaining > 1:
+            if not messagebox.askyesno(
+                    "칸이 1개로만 잡혔습니다",
+                    "여러 칸을 선택하셨다면 두 가지를 확인해 주세요.\n\n"
+                    "1. 프로그램 창의 버튼을 클릭하면 한글의 선택이 풀립니다.\n"
+                    "   한글 창을 보고 있는 상태에서 Ctrl+Shift+A 를 누르세요.\n\n"
+                    "2. 그래도 1개면 [진단]의 셀필드 option 을\n"
+                    "   1, 2, 3 으로 바꿔가며 다시 시도해 보세요.\n\n"
+                    "이대로 1장만 넣을까요?", parent=self):
+                self.log("사용자가 삽입을 취소했습니다.")
+                return
 
         if len(cells) != remaining:
             if not messagebox.askyesno(
@@ -896,7 +921,7 @@ class App(tk.Tk):
         if not self.ctrl.connected:
             messagebox.showinfo("안내", "먼저 [한글 연결]을 눌러주세요.", parent=self)
             return
-        probe = self.ctrl.selection_probe()
+        probe = self.ctrl.selection_probe(option=self.var_field_option.get())
         detail = "\n".join(f"{k} : {v}" for k, v in probe.items())
         self.log("선택 영역 확인\n" + detail)
         messagebox.showinfo("선택 영역 확인", detail, parent=self)
