@@ -5,8 +5,8 @@
 한글에서 선택한 표 칸에 사진을 순서대로 넣는 프로그램.
 
 사용 흐름
-  1) 한글에서 사진대지 양식을 연다
-  2) [한글 연결]
+  1) 한글에서 사진대지 양식을 연다 (프로그램은 문서를 열지 않는다)
+  2) [문서 연결] — 이미 실행 중인 한글의 현재 문서에 붙는다
   3) 사진을 목록에 담는다
   4) 한글에서 사진을 넣을 칸들을 드래그로 선택
   5) Ctrl+Shift+A  →  선택한 칸에 목록 순서대로 삽입
@@ -75,45 +75,39 @@ class HwpController:
         return self.hwp is not None
 
     def connect(self) -> bool:
-        """이미 실행 중인 한글에 먼저 붙고, 없으면 새로 띄운다."""
+        """이미 실행 중인 한글에 붙는다.
+
+        새 인스턴스는 절대 띄우지 않는다. EnsureDispatch 로 폴백하면
+        빈 문서가 새로 열리고, 사용자가 보고 있는 문서와 다른 창을
+        조종하게 된다."""
         try:
             import win32com.client as win32
         except ImportError:
             raise HwpError("pywin32 가 설치되어 있지 않습니다.\n  pip install pywin32")
 
-        hwp, attached = None, False
         try:
             hwp = win32.GetActiveObject("HWPFrame.HwpObject")
-            attached = True
-        except Exception:
-            hwp = None
-
-        if hwp is None:
-            try:
-                hwp = win32.gencache.EnsureDispatch("HWPFrame.HwpObject")
-            except Exception:
-                try:
-                    hwp = win32.Dispatch("HWPFrame.HwpObject")
-                except Exception as e:
-                    raise HwpError("한글에 연결하지 못했습니다.\n"
-                                   "한글을 먼저 실행하고 문서를 열어주세요.\n\n"
-                                   f"({e})")
+        except Exception as e:
+            raise HwpError(
+                "실행 중인 한글을 찾지 못했습니다.\n\n"
+                "한글을 먼저 실행하고, 사진을 넣을 문서를 연 뒤\n"
+                "다시 [문서 연결] 을 눌러주세요.\n\n"
+                f"({e})")
 
         try:
             hwp.RegisterModule("FilePathCheckDLL", "FilePathChecker")
         except Exception:
             pass
-        try:
-            hwp.XHwpWindows.Item(0).Visible = True
-        except Exception:
-            pass
 
         self.hwp = hwp
-        return attached
+        if not self.doc_path() and not self.documents():
+            raise HwpError("한글에 열려 있는 문서가 없습니다.\n"
+                           "사진을 넣을 문서를 먼저 열어주세요.")
+        return True
 
     def _require(self):
         if self.hwp is None:
-            raise HwpError("한글에 연결되어 있지 않습니다. [한글 연결]을 먼저 눌러주세요.")
+            raise HwpError("한글 문서에 연결되어 있지 않습니다. [문서 연결]을 먼저 눌러주세요.")
 
     # ---------------- 문서 ----------------
     def doc_path(self) -> str:
@@ -484,7 +478,7 @@ class App(tk.Tk):
 
         bar = ttk.Frame(root)
         bar.pack(fill="x", pady=(0, 8))
-        ttk.Button(bar, text="한글 연결", command=self.on_connect, width=12).pack(side="left")
+        ttk.Button(bar, text="문서 연결", command=self.on_connect, width=12).pack(side="left")
         self.lbl_status = ttk.Label(bar, text="연결 안 됨", foreground="#b00")
         self.lbl_status.pack(side="left", padx=10)
 
@@ -726,10 +720,10 @@ class App(tk.Tk):
 
     @guarded
     def on_connect(self):
-        attached = self.ctrl.connect()
+        self.ctrl.connect()
         self._update_status()
-        self.log("실행 중인 한글에 연결했습니다." if attached else "한글을 새로 실행했습니다.")
         docs = self.ctrl.documents()
+        self.log(f"연결했습니다. 작업 대상: {self.ctrl.doc_name()}")
         self.log(f"열린 문서 {len(docs)}개: {docs}")
         if len(docs) > 1:
             messagebox.showwarning(
@@ -768,7 +762,7 @@ class App(tk.Tk):
 
     def _ready(self) -> bool:
         if not self.ctrl.connected:
-            messagebox.showinfo("안내", "먼저 [한글 연결]을 눌러주세요.", parent=self)
+            messagebox.showinfo("안내", "먼저 [문서 연결]을 눌러주세요.", parent=self)
             return False
         if not self.photos:
             messagebox.showinfo("안내", "사진 목록이 비어 있습니다.", parent=self)
@@ -846,7 +840,7 @@ class App(tk.Tk):
     @guarded
     def on_check_selection(self):
         if not self.ctrl.connected:
-            messagebox.showinfo("안내", "먼저 [한글 연결]을 눌러주세요.", parent=self)
+            messagebox.showinfo("안내", "먼저 [문서 연결]을 눌러주세요.", parent=self)
             return
         probe = self.ctrl.selection_probe()
         detail = "\n".join(f"{k} : {v}" for k, v in probe.items())
@@ -856,7 +850,7 @@ class App(tk.Tk):
     @guarded
     def on_check_cursor(self):
         if not self.ctrl.connected:
-            messagebox.showinfo("안내", "먼저 [한글 연결]을 눌러주세요.", parent=self)
+            messagebox.showinfo("안내", "먼저 [문서 연결]을 눌러주세요.", parent=self)
             return
         pos = self.ctrl.get_pos()
         size = self.ctrl.cell_size()
