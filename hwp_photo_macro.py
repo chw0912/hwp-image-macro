@@ -193,27 +193,26 @@ class HwpController:
             return False
 
     # ---------------- 커서 상태 ----------------
-    def save(self) -> bool:
-        self._require()
-        try:
-            self.hwp.Save()
-            return True
-        except Exception:
-            return False
-
     def make_backup(self) -> str:
-        """현재 문서를 저장한 뒤 같은 폴더에 백업 사본을 만든다.
+        """디스크에 저장된 문서 파일을 그대로 복사한다.
 
-        한글이 COM 으로 이뤄진 편집을 되돌리기 목록에 쌓지 않는 경우가 있어,
-        Undo 대신 이 사본이 실질적인 복구 수단이 된다."""
+        hwp.Save() 는 부르지 않는다. COM 으로 저장하면 되돌리기 기록이 사라지고,
+        한글이 파일을 쥐고 있는 동안 건드리면 '공유 위반' 이 뜬다.
+        따라서 저장하지 않은 변경분은 백업에 포함되지 않는다."""
         path = self.doc_path()
         if not path:
             raise HwpError("문서가 아직 파일로 저장되지 않았습니다.\n"
                            "한글에서 먼저 저장한 뒤 다시 시도해 주세요.")
-        self.save()
+        if not os.path.exists(path):
+            raise HwpError(f"문서 파일을 찾을 수 없습니다.\n{path}")
         stem, ext = os.path.splitext(path)
         backup = f"{stem}_backup_{datetime.now():%Y%m%d_%H%M%S}{ext}"
-        shutil.copy2(path, backup)
+        try:
+            shutil.copy2(path, backup)
+        except OSError as e:
+            raise HwpError("백업본을 만들지 못했습니다.\n"
+                           "한글이 파일을 사용 중일 수 있습니다.\n\n"
+                           f"({e})")
         return backup
 
     def undo(self, times: int = 1) -> int:
@@ -221,11 +220,8 @@ class HwpController:
         self._require()
         done = 0
         for _ in range(max(times, 0)):
-            before = self.get_pos()
             self.run("Undo")
             done += 1
-            if before is not None and self.get_pos() == before and done > 1:
-                pass  # 위치가 안 바뀌어도 되돌려진 경우가 있어 멈추지는 않는다
         return done
 
     def get_pos(self):
@@ -631,9 +627,11 @@ class App(tk.Tk):
 
         undo = ttk.LabelFrame(right, text="복구", padding=8)
         undo.pack(fill="x", pady=(8, 0))
-        self.var_backup = tk.BooleanVar(value=True)
+        self.var_backup = tk.BooleanVar(value=False)
         ttk.Checkbutton(undo, text="넣기 전에 백업본 만들기",
                         variable=self.var_backup).grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(undo, text="저장된 내용만 복사됩니다", foreground="#666")\
+            .grid(row=0, column=0, columnspan=2, sticky="w", pady=(20, 0))
         ttk.Button(undo, text="지금 백업본 만들기", command=self.on_backup)\
             .grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         ttk.Label(undo, text="되돌리기 횟수").grid(row=2, column=0, sticky="w", pady=(8, 0))
