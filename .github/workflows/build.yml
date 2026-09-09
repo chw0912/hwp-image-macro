@@ -58,7 +58,7 @@ jobs:
             hwp_image_macro.zip
 
       - name: 릴리즈에 첨부
-        if: startsWith(.github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: |
