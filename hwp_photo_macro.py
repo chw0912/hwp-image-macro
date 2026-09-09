@@ -15,6 +15,7 @@ import ctypes
 import functools
 import os
 import re
+import shutil
 import sys
 import threading
 import time
@@ -192,10 +193,32 @@ class HwpController:
             return False
 
     # ---------------- 커서 상태 ----------------
+    def save(self) -> bool:
+        self._require()
+        try:
+            self.hwp.Save()
+            return True
+        except Exception:
+            return False
+
+    def make_backup(self) -> str:
+        """현재 문서를 저장한 뒤 같은 폴더에 백업 사본을 만든다.
+
+        한글이 COM 으로 이뤄진 편집을 되돌리기 목록에 쌓지 않는 경우가 있어,
+        Undo 대신 이 사본이 실질적인 복구 수단이 된다."""
+        path = self.doc_path()
+        if not path:
+            raise HwpError("문서가 아직 파일로 저장되지 않았습니다.\n"
+                           "한글에서 먼저 저장한 뒤 다시 시도해 주세요.")
+        self.save()
+        stem, ext = os.path.splitext(path)
+        backup = f"{stem}_backup_{datetime.now():%Y%m%d_%H%M%S}{ext}"
+        shutil.copy2(path, backup)
+        return backup
+
     def undo(self, times: int = 1) -> int:
         """한글의 되돌리기를 지정한 횟수만큼 실행한다."""
         self._require()
-        self.escape_selection()
         done = 0
         for _ in range(max(times, 0)):
             before = self.get_pos()
@@ -333,8 +356,8 @@ class HwpController:
             hwp.InsertPicture(path, True)
         if post_adjust or border_px > 0:
             self._apply_shape(w, h, border_px)
-        # 그림이 선택된 채로 남으면 칸 이동이 되지 않으므로 편집 상태로 되돌린다
-        self.escape_selection()
+        # [진단 1단계] Run("Cancel") 이 되돌리기 기록을 끊는지 확인하기 위해
+        # 삽입 경로에서는 escape_selection() 을 호출하지 않는다.
         self.set_pos(before)
         return (cw, ch), (w, h)
 
@@ -451,6 +474,7 @@ class App(tk.Tk):
         self.photos = []
         self.cursor = 0
         self._thumb = None
+        self._thr_cache = None   # 사진 칸 기준 높이. 매번 표를 훑지 않도록 재사용한다.
 
         self._build_ui()
         self._bind_keys()
@@ -555,6 +579,7 @@ class App(tk.Tk):
         ttk.Label(form, text="사진 칸 최소 높이(mm)").grid(row=2, column=0, sticky="w",
                                                     padx=18, pady=(4, 0))
         self.var_min_h = tk.DoubleVar(value=0.0)
+        self.var_min_h.trace_add("write", lambda *_: self._invalidate_plan())
         self.sp_min_h = ttk.Spinbox(form, from_=0, to=200, increment=5, width=6,
                                     textvariable=self.var_min_h)
         self.sp_min_h.grid(row=2, column=1, sticky="e", pady=(4, 0))
@@ -604,14 +629,21 @@ class App(tk.Tk):
         ttk.Button(act, text="칸 이동 진단", command=self.on_diagnose_move).pack(fill="x", pady=2)
         ttk.Button(act, text="넣을 위치 처음으로", command=self.on_reset_cursor).pack(fill="x", pady=2)
 
-        undo = ttk.LabelFrame(right, text="되돌리기", padding=8)
+        undo = ttk.LabelFrame(right, text="복구", padding=8)
         undo.pack(fill="x", pady=(8, 0))
-        ttk.Label(undo, text="횟수").grid(row=0, column=0, sticky="w")
+        self.var_backup = tk.BooleanVar(value=True)
+        ttk.Checkbutton(undo, text="넣기 전에 백업본 만들기",
+                        variable=self.var_backup).grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Button(undo, text="지금 백업본 만들기", command=self.on_backup)\
+            .grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        ttk.Label(undo, text="되돌리기 횟수").grid(row=2, column=0, sticky="w", pady=(8, 0))
         self.var_undo_n = tk.IntVar(value=10)
         ttk.Spinbox(undo, from_=1, to=200, increment=1, width=6,
-                    textvariable=self.var_undo_n).grid(row=0, column=1, sticky="e")
-        ttk.Button(undo, text="한글 되돌리기 실행", command=self.on_undo)\
-            .grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+                    textvariable=self.var_undo_n).grid(row=2, column=1, sticky="e", pady=(8, 0))
+        ttk.Button(undo, text="되돌리기 시도", command=self.on_undo)\
+            .grid(row=3, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        ttk.Label(undo, text="한글이 받아주지 않으면 동작하지 않습니다",
+                  foreground="#666", wraplength=230).grid(row=4, column=0, columnspan=2, sticky="w")
 
         self.lbl_progress = ttk.Label(right, text="", foreground="#555", wraplength=250)
         self.lbl_progress.pack(fill="x")
@@ -619,6 +651,20 @@ class App(tk.Tk):
 
     def _toggle_mode(self):
         self.sp_min_h.configure(state="normal" if self.var_mode.get() == "auto" else "disabled")
+        self._invalidate_plan()
+
+    def _invalidate_plan(self):
+        """표 기준값을 버린다. 다음 삽입 때 다시 계산한다."""
+        self._thr_cache = None
+
+    def _threshold(self) -> int:
+        """사진 칸 기준 높이. 한 번 계산해두고 재사용한다.
+
+        한 장 넣을 때마다 표 전체를 훑으면 칸이 많은 표에서 눈에 띄게 느리다."""
+        if self._thr_cache is None:
+            thr, _ = self._plan()
+            self._thr_cache = thr
+        return self._thr_cache
 
     def _bind_keys(self):
         self.bind("<Control-q>", lambda e: self.on_insert_one())
@@ -820,6 +866,7 @@ class App(tk.Tk):
             self.log("문서 선택을 취소했습니다.")
             return
         self.ctrl.open_document(path)
+        self._invalidate_plan()
         self._update_status()
         self.log(f"문서를 열었습니다: {os.path.basename(path)}")
 
@@ -883,6 +930,7 @@ class App(tk.Tk):
             return
         sizes = self.ctrl.scan_cells()
         thr, available = self._plan()
+        self._thr_cache = thr
         heights = sorted({round(h / HWPUNIT_PER_MM) for _, h in sizes})
         remaining = len(self.photos) - self.cursor
         verdict = ""
@@ -926,23 +974,60 @@ class App(tk.Tk):
         messagebox.showinfo("칸 이동 진단", text, parent=self)
 
     @guarded
+    def on_backup(self):
+        if not self.ctrl.connected:
+            messagebox.showinfo("안내", "먼저 [한글 연결]을 눌러주세요.", parent=self)
+            return
+        backup = self.ctrl.make_backup()
+        self.log(f"백업본 생성: {os.path.basename(backup)}")
+        messagebox.showinfo("백업 완료",
+                            f"같은 폴더에 사본을 만들었습니다.\n\n{os.path.basename(backup)}",
+                            parent=self)
+
+    @guarded
     def on_undo(self):
         if not self.ctrl.connected:
             messagebox.showinfo("안내", "먼저 [한글 연결]을 눌러주세요.", parent=self)
             return
         n = self.var_undo_n.get()
+        before = self.ctrl.get_pos()
         done = self.ctrl.undo(n)
-        self.log(f"되돌리기 {done}회 실행")
+        after = self.ctrl.get_pos()
+        moved = before != after
+        self.log(f"되돌리기 {done}회 시도 — 문서 상태 변화: {'있음' if moved else '없음'}")
+        if not moved:
+            messagebox.showinfo(
+                "되돌리기가 동작하지 않습니다",
+                "한글이 이 편집을 되돌리기 목록에 쌓지 않는 것으로 보입니다.\n\n"
+                "[지금 백업본 만들기] 로 사본을 미리 만들어두고 작업하시거나,\n"
+                "잘못된 경우 저장하지 않고 문서를 닫았다가 다시 여세요.",
+                parent=self)
 
     @guarded
     def on_reset_cursor(self):
         self.cursor = 0
+        self._invalidate_plan()
         self._refresh()
         self.log("넣을 위치를 목록 처음으로 되돌렸습니다.")
+
+    def _check_saved(self) -> bool:
+        """저장되지 않은 문서에서는 한글이 되돌리기를 받아주지 않는다."""
+        if self.ctrl.doc_path():
+            return True
+        self.log("[경고] 문서가 파일로 저장되지 않았습니다.")
+        return messagebox.askyesno(
+            "저장되지 않은 문서입니다",
+            "이 문서는 아직 파일로 저장되지 않았습니다.\n\n"
+            "이 상태에서는 한글의 되돌리기(Ctrl+Z)가 동작하지 않고,\n"
+            "백업본도 만들 수 없습니다.\n\n"
+            "한글에서 먼저 저장하신 뒤 진행하시기를 권합니다.\n"
+            "그래도 이대로 진행할까요?", parent=self)
 
     def _ready(self) -> bool:
         if not self.ctrl.connected:
             messagebox.showinfo("안내", "먼저 [한글 연결]을 눌러주세요.", parent=self)
+            return False
+        if not self._check_saved():
             return False
         if not self.photos:
             messagebox.showinfo("안내", "사진 목록이 비어 있습니다.", parent=self)
@@ -954,7 +1039,6 @@ class App(tk.Tk):
 
     def _advance(self, thr: int, pending_caption: str) -> bool:
         """다음 사진 칸까지 이동하며 도중의 작은 칸에 캡션을 쓴다. 표 끝이면 False."""
-        self.ctrl.escape_selection()
         for step in range(MAX_CELL_WALK):
             if not self.ctrl.move_cell("TableRightCell"):
                 self.log(f"이동 중단: 오른쪽 칸으로 갈 수 없습니다 ({step}칸 이동 후)")
@@ -975,7 +1059,7 @@ class App(tk.Tk):
         if not self._ready():
             return
         margins, border = self._insert_options()
-        thr, _ = self._plan()
+        thr = self._threshold()
         item = self.photos[self.cursor]
         cell, pic = self.ctrl.insert_picture_fit(
             item["path"], margins, border, post_adjust=self.var_post_adjust.get())
@@ -991,6 +1075,19 @@ class App(tk.Tk):
             return
         margins, border = self._insert_options()
         thr, available = self._plan()
+        self._thr_cache = thr
+
+        if self.var_backup.get():
+            try:
+                backup = self.ctrl.make_backup()
+                self.log(f"백업본 생성: {os.path.basename(backup)}")
+            except HwpError as e:
+                if not messagebox.askyesno(
+                        "백업을 만들지 못했습니다",
+                        f"{e}\n\n백업 없이 그대로 진행할까요?", parent=self):
+                    return
+                self.log("백업 없이 진행합니다.")
+
         remaining = len(self.photos) - self.cursor
         if available < remaining:
             go = messagebox.askyesno(
