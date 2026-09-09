@@ -134,14 +134,56 @@ class HwpController:
         if self.hwp is None:
             raise HwpError("한글에 연결되어 있지 않습니다. [한글 연결]을 먼저 눌러주세요.")
 
-    def open_document(self, path: str):
-        """지정한 문서를 열어 작업 대상으로 삼는다."""
+    def selected_cells(self):
+        """셀 블록으로 선택된 칸들의 list 번호를 순서대로 돌려준다.
+
+        한글은 표의 칸마다 별도의 list 번호를 매기고, 그 번호는
+        왼쪽 위에서 오른쪽 아래로 순서대로 붙는다.
+        GetSelectedPos() 로 선택 범위의 시작/끝 list 를 얻어
+        그 사이에서 실제로 칸인 것만 추린다."""
         self._require()
+        try:
+            res = self.hwp.GetSelectedPos()
+        except Exception:
+            return []
+        if not res or not res[0]:
+            return []
+        try:
+            _, slist, _spara, _spos, elist, _epara, _epos = res
+        except (ValueError, TypeError):
+            return []
+
+        slist, elist = int(slist), int(elist)
+        if elist < slist:
+            slist, elist = elist, slist
+        if elist - slist > MAX_CELL_WALK:
+            elist = slist + MAX_CELL_WALK
+
+        found = []
+        for lid in range(slist, elist + 1):
+            if self.set_pos((lid, 0, 0)) and self.cell_size() is not None:
+                found.append(lid)
+        return found
+
+    def goto_cell(self, list_id: int) -> bool:
+        return self.set_pos((list_id, 0, 0)) and self.cell_size() is not None
+
+    def open_document(self, path: str) -> bool:
+        """지정한 문서를 열어 작업 대상으로 삼는다.
+
+        이미 열려 있는 문서를 다시 열면 같은 파일이 중복으로 열리면서
+        '공유 위반' 이 뜨거나 편집이 제한될 수 있으므로 건너뛴다.
+        돌려주는 값은 실제로 열었는지 여부."""
+        self._require()
+        current = self.doc_path()
+        if current and os.path.normcase(os.path.abspath(current)) == \
+                os.path.normcase(os.path.abspath(path)):
+            return False
         last = None
         for args in ((path,), (path, "", "forceopen:true"), (path, "", "")):
             try:
                 self.hwp.Open(*args)
-                return
+                return True
             except Exception as e:
                 last = e
         raise HwpError(f"문서를 열지 못했습니다.\n{path}\n\n({last})")
@@ -574,7 +616,8 @@ class App(tk.Tk):
         ttk.Radiobutton(place, text="선택한 칸에만 넣기", value="manual",
                         variable=self.var_place, command=self._toggle_place)\
             .grid(row=0, column=0, sticky="w")
-        ttk.Label(place, text="커서가 있는 칸에 한 장 넣고 멈춥니다",
+        ttk.Label(place, text="Ctrl+Q 는 커서 칸에 한 장, "
+                              "[한번에 넣기] 는 드래그로 선택한 칸들에",
                   foreground="#666", wraplength=230).grid(row=1, column=0, sticky="w", padx=18)
         ttk.Radiobutton(place, text="자동으로 이어서 넣기", value="auto",
                         variable=self.var_place, command=self._toggle_place)\
@@ -645,6 +688,7 @@ class App(tk.Tk):
         ttk.Button(act, text="한 장 넣기  (Ctrl+Q)", command=self.on_insert_one).pack(fill="x", pady=2)
         ttk.Button(act, text="한번에 넣기  (Ctrl+Shift+A)", command=self.on_insert_all).pack(fill="x", pady=2)
         ttk.Button(act, text="표 구조 확인", command=self.on_check_table).pack(fill="x", pady=2)
+        ttk.Button(act, text="선택 영역 확인", command=self.on_check_selection).pack(fill="x", pady=2)
         ttk.Button(act, text="칸 이동 진단", command=self.on_diagnose_move).pack(fill="x", pady=2)
         ttk.Button(act, text="넣을 위치 처음으로", command=self.on_reset_cursor).pack(fill="x", pady=2)
 
@@ -898,10 +942,13 @@ class App(tk.Tk):
         if not path:
             self.log("문서 선택을 취소했습니다.")
             return
-        self.ctrl.open_document(path)
+        opened = self.ctrl.open_document(path)
         self._invalidate_plan()
         self._update_status()
-        self.log(f"문서를 열었습니다: {os.path.basename(path)}")
+        if opened:
+            self.log(f"문서를 열었습니다: {os.path.basename(path)}")
+        else:
+            self.log(f"이미 열려 있는 문서입니다. 그대로 사용합니다: {os.path.basename(path)}")
 
     @guarded
     def on_refresh_doc(self):
@@ -1109,17 +1156,74 @@ class App(tk.Tk):
                      f"(현재 {self.ctrl.get_pos()})")
         self._refresh()
 
+    def _insert_into_selection(self):
+        """한글에서 드래그로 선택한 칸들에 순서대로 넣는다."""
+        cells = self.ctrl.selected_cells()
+        if not cells:
+            messagebox.showinfo(
+                "칸을 선택해 주세요",
+                "한글 문서에서 사진을 넣을 칸들을 드래그로 선택한 뒤\n"
+                "다시 [한번에 넣기] 를 눌러주세요.\n\n"
+                "한 칸씩 넣으시려면 [한 장 넣기] 또는 Ctrl+Q 를 쓰시면 됩니다.",
+                parent=self)
+            return
+
+        remaining = len(self.photos) - self.cursor
+        count = min(len(cells), remaining)
+        self.log(f"선택된 칸 {len(cells)}개, 넣을 사진 {remaining}장 → {count}장 삽입")
+
+        if len(cells) != remaining:
+            if not messagebox.askyesno(
+                    "개수가 다릅니다",
+                    f"선택한 칸 : {len(cells)}개\n"
+                    f"넣을 사진 : {remaining}장\n\n"
+                    f"앞에서부터 {count}장만 넣습니다. 진행할까요?", parent=self):
+                self.log("사용자가 삽입을 취소했습니다.")
+                return
+
+        margins, border = self._insert_options()
+        inserted = 0
+        for lid in cells[:count]:
+            if not self.ctrl.goto_cell(lid):
+                self.log(f"칸 {lid} 로 이동하지 못해 건너뜁니다.")
+                continue
+            item = self.photos[self.cursor]
+            cell, pic, _pos = self.ctrl.insert_picture_fit(
+                item["path"], margins, border,
+                post_adjust=self.var_post_adjust.get())
+            self.cursor += 1
+            inserted += 1
+            self.log(f"삽입 {inserted}: {os.path.basename(item['path'])} — "
+                     f"칸 {self._mm(cell)}, 사진 {self._mm(pic)}")
+        self.log(f"완료: 이번에 {inserted}장 삽입")
+        self._refresh()
+
+    @guarded
+    def on_check_selection(self):
+        """선택한 칸이 제대로 읽히는지 확인한다."""
+        if not self.ctrl.connected:
+            messagebox.showinfo("안내", "먼저 [한글 연결]을 눌러주세요.", parent=self)
+            return
+        cells = self.ctrl.selected_cells()
+        self.log(f"선택 영역 확인: 칸 {len(cells)}개 {cells[:20]}")
+        if not cells:
+            messagebox.showinfo(
+                "선택 영역 확인",
+                "선택된 칸을 찾지 못했습니다.\n\n"
+                "한글에서 칸들을 드래그로 선택한 뒤 다시 눌러주세요.", parent=self)
+            return
+        messagebox.showinfo(
+            "선택 영역 확인",
+            f"선택된 칸 : {len(cells)}개\n"
+            f"칸 번호   : {cells[:20]}{' ...' if len(cells) > 20 else ''}\n\n"
+            f"넣을 사진 : {len(self.photos) - self.cursor}장", parent=self)
+
     @guarded
     def on_insert_all(self):
         if not self._ready():
             return
         if self.var_place.get() == "manual":
-            messagebox.showinfo(
-                "선택한 칸 모드입니다",
-                "지금은 커서가 있는 칸에만 한 장씩 넣는 방식입니다.\n\n"
-                "[한 장 넣기] 또는 Ctrl+Q 를 쓰시거나,\n"
-                "여러 장을 이어서 넣으려면 삽입 방식을\n"
-                "[자동으로 이어서 넣기] 로 바꿔주세요.", parent=self)
+            self._insert_into_selection()
             return
 
         margins, border = self._insert_options()
