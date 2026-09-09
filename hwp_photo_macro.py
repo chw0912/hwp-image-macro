@@ -289,6 +289,45 @@ class HwpController:
         self._clear_field_name(name)
         return ids
 
+    def block_cell_addresses(self):
+        """선택된 블록에 들어 있는 칸들의 (열, 행) 주소를 뽑는다.
+
+        HWPML2X 로 블록만 내보내면 <CELL ColAddr="2" RowAddr="4" ...> 형태로
+        각 칸의 주소가 들어 있다. 선택을 건드리지 않는다."""
+        self._require()
+        try:
+            raw = self.hwp.GetTextFile("HWPML2X", "saveblock:true")
+        except Exception as e:
+            raise HwpError(f"블록을 읽지 못했습니다.\n({e})")
+        if not raw:
+            return []
+        text = str(raw)
+        addrs = []
+        for m in re.finditer(r"<CELL\b[^>]*>", text):
+            tag = m.group(0)
+            col = re.search(r'ColAddr="(\d+)"', tag)
+            row = re.search(r'RowAddr="(\d+)"', tag)
+            if col and row:
+                addrs.append((int(col.group(1)), int(row.group(1))))
+        return addrs
+
+    def cell_addr(self):
+        """현재 커서가 있는 칸의 주소 문자열. 상태 표시줄의 (D5) 와 같은 값."""
+        self._require()
+        try:
+            ind = self.hwp.KeyIndicator()
+        except Exception:
+            return None
+        try:
+            for part in ind:
+                if isinstance(part, str):
+                    m = re.search(r"\(([A-Z]+\d+)\)", part)
+                    if m:
+                        return m.group(1)
+        except TypeError:
+            pass
+        return str(ind)
+
     def _probe_field_count(self):
         """이름을 붙인 직후 개수만 세어본다. 몇 칸에 붙었는지 바로 알 수 있다."""
         name = FIELD_TAG + "_probe"
@@ -346,6 +385,12 @@ class HwpController:
             report["GetSelectedPos"] = self.hwp.GetSelectedPos()
         except Exception as e:
             report["GetSelectedPos"] = f"실패: {e}"
+        report["셀 주소(KeyIndicator)"] = self.cell_addr()
+        try:
+            addrs = self.block_cell_addresses()
+            report["블록 칸 주소"] = f"{len(addrs)}개 {addrs[:20]}"
+        except Exception as e:
+            report["블록 칸 주소"] = f"실패: {e}"
         try:
             report.update(self.block_text_probe())
         except Exception as e:
@@ -779,6 +824,7 @@ class App(tk.Tk):
         self._update_status()
         self.log(("문서를 열었습니다: " if opened else "이미 열려 있는 문서입니다: ")
                  + os.path.basename(path))
+        docs = self.ctrl.documents()
         if len(docs) > 1:
             messagebox.showwarning(
                 "문서가 여러 개 열려 있습니다",
