@@ -191,6 +191,40 @@ class HwpController:
         except Exception:
             return False
 
+    # ---------------- 커서 상태 ----------------
+    def get_pos(self):
+        """현재 캐럿 위치 (list, para, pos). 실패하면 None."""
+        self._require()
+        try:
+            return self.hwp.GetPos()
+        except Exception:
+            return None
+
+    def set_pos(self, pos) -> bool:
+        if not pos:
+            return False
+        try:
+            return bool(self.hwp.SetPos(*pos))
+        except Exception:
+            return False
+
+    def escape_selection(self):
+        """개체가 선택된 상태를 풀고 글자 편집 상태로 되돌린다.
+
+        사진을 넣은 직후에는 그 그림이 선택된 상태라
+        TableRightCell 같은 칸 이동 명령이 먹지 않는다."""
+        try:
+            self.hwp.Run("Cancel")
+        except Exception:
+            pass
+
+    def move_cell(self, action: str) -> bool:
+        """칸 이동. 한 번 실패하면 선택을 풀고 다시 시도한다."""
+        if self.run(action):
+            return True
+        self.escape_selection()
+        return self.run(action)
+
     # ---------------- 표 훑기 ----------------
     def scan_cells(self):
         """현재 칸부터 표 끝까지 각 칸의 (너비, 높이)를 모으고 원래 칸으로 복귀."""
@@ -201,11 +235,11 @@ class HwpController:
             if s is None:
                 break
             sizes.append(s)
-            if not self.run("TableRightCell"):
+            if not self.move_cell("TableRightCell"):
                 break
             steps += 1
         for _ in range(steps):
-            self.run("TableLeftCell")
+            self.move_cell("TableLeftCell")
         return sizes
 
     # ---------------- 삽입 ----------------
@@ -229,8 +263,13 @@ class HwpController:
         except Exception:
             return 4, 3
 
-    def insert_picture_fit(self, path: str, margins_px=(0, 0, 0, 0), border_px=0.0):
-        """현재 칸 크기에 맞춰 비율을 유지한 채 삽입. margins_px = (상, 하, 좌, 우) 픽셀"""
+    def insert_picture_fit(self, path: str, margins_px=(0, 0, 0, 0), border_px=0.0,
+                           post_adjust: bool = False):
+        """현재 칸 크기에 맞춰 비율을 유지한 채 삽입. margins_px = (상, 하, 좌, 우) 픽셀
+
+        post_adjust 를 켜면 삽입 후 ShapeObjDialog 로 크기와 테두리를 다시 지정한다.
+        이 단계는 지정하지 않은 속성까지 기본값으로 함께 적용되므로,
+        그림이 선택되지 않거나 배치가 이상해지면 꺼야 한다."""
         self._require()
         if not os.path.exists(path):
             raise HwpError(f"사진 파일을 찾을 수 없습니다.\n{path}")
@@ -250,12 +289,17 @@ class HwpController:
         h = max(int(ih * scale), 1)
 
         hwp = self.hwp
+        before = self.get_pos()          # 삽입 전 캐럿 위치를 기억해 둔다
         hwp.Run("ParagraphShapeAlignCenter")
         try:
             hwp.InsertPicture(path, True, 2, False, False, 0, w, h)
         except Exception:
             hwp.InsertPicture(path, True)
-        self._apply_shape(w, h, border_px)
+        if post_adjust or border_px > 0:
+            self._apply_shape(w, h, border_px)
+        # 그림이 선택된 채로 남으면 칸 이동이 되지 않으므로 편집 상태로 되돌린다
+        self.escape_selection()
+        self.set_pos(before)
 
     def _apply_shape(self, w: int, h: int, border_px: float):
         hwp = self.hwp
@@ -266,6 +310,12 @@ class HwpController:
             so.Width = w
             so.Height = h
             so.TreatAsChar = 1
+            # 개체 보호가 켜진 채로 적용되면 그림을 클릭해도 선택되지 않는다
+            for key in ("Lock", "Protect"):
+                try:
+                    setattr(so, key, 0)
+                except Exception:
+                    pass
             if border_px > 0:
                 try:
                     so.LineShape.Type = 1
@@ -502,6 +552,12 @@ class App(tk.Tk):
         self.var_border_px = tk.IntVar(value=1)
         ttk.Spinbox(bd, from_=1, to=20, increment=1, width=6,
                     textvariable=self.var_border_px).grid(row=0, column=1, sticky="e")
+        self.var_post_adjust = tk.BooleanVar(value=False)
+        ttk.Checkbutton(bd, text="삽입 후 크기 다시 지정",
+                        variable=self.var_post_adjust)\
+            .grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Label(bd, text="그림이 선택되지 않으면 꺼두세요",
+                  foreground="#666").grid(row=2, column=0, columnspan=2, sticky="w")
 
         act = ttk.Frame(right)
         act.pack(fill="x", pady=12)
@@ -812,11 +868,14 @@ class App(tk.Tk):
 
     def _advance(self, thr: int, pending_caption: str) -> bool:
         """다음 사진 칸까지 이동하며 도중의 작은 칸에 캡션을 쓴다. 표 끝이면 False."""
-        for _ in range(MAX_CELL_WALK):
-            if not self.ctrl.run("TableRightCell"):
+        self.ctrl.escape_selection()
+        for step in range(MAX_CELL_WALK):
+            if not self.ctrl.move_cell("TableRightCell"):
+                self.log(f"이동 중단: 오른쪽 칸으로 갈 수 없습니다 ({step}칸 이동 후)")
                 return False
             size = self.ctrl.cell_size()
             if size is None:
+                self.log(f"이동 중단: 표 밖으로 나갔습니다 ({step + 1}칸 이동 후)")
                 return False
             if size[1] >= thr:
                 return True
@@ -832,7 +891,8 @@ class App(tk.Tk):
         margins, border = self._insert_options()
         thr, _ = self._plan()
         item = self.photos[self.cursor]
-        self.ctrl.insert_picture_fit(item["path"], margins, border)
+        self.ctrl.insert_picture_fit(item["path"], margins, border,
+                                     post_adjust=self.var_post_adjust.get())
         self.cursor += 1
         self.log(f"삽입: {os.path.basename(item['path'])}")
         self._advance(thr, self._caption_for(item))
@@ -862,7 +922,8 @@ class App(tk.Tk):
         inserted = 0
         while self.cursor < len(self.photos):
             item = self.photos[self.cursor]
-            self.ctrl.insert_picture_fit(item["path"], margins, border)
+            self.ctrl.insert_picture_fit(item["path"], margins, border,
+                                     post_adjust=self.var_post_adjust.get())
             self.cursor += 1
             inserted += 1
             self.log(f"삽입 {inserted}: {os.path.basename(item['path'])}")
