@@ -352,10 +352,13 @@ class HwpController:
             hwp.InsertPicture(path, True)
         if post_adjust or border_px > 0:
             self._apply_shape(w, h, border_px)
-        # [진단 1단계] Run("Cancel") 이 되돌리기 기록을 끊는지 확인하기 위해
-        # 삽입 경로에서는 escape_selection() 을 호출하지 않는다.
-        self.set_pos(before)
-        return (cw, ch), (w, h)
+
+        # Cancel 은 되돌리기와 무관한 것으로 확인됐고, 칸 이동에는 필요하다.
+        self.escape_selection()
+        # [진단 2단계] SetPos 가 되돌리기 기록을 끊는지 확인하기 위해
+        # 커서 위치 복원은 하지 않는다.
+        after = self.get_pos()
+        return (cw, ch), (w, h), (before, after)
 
     def _apply_shape(self, w: int, h: int, border_px: float):
         hwp = self.hwp
@@ -1059,12 +1062,15 @@ class App(tk.Tk):
         margins, border = self._insert_options()
         thr = self._threshold()
         item = self.photos[self.cursor]
-        cell, pic = self.ctrl.insert_picture_fit(
+        cell, pic, pos = self.ctrl.insert_picture_fit(
             item["path"], margins, border, post_adjust=self.var_post_adjust.get())
         self.cursor += 1
         self.log(f"삽입: {os.path.basename(item['path'])} — "
                  f"칸 {self._mm(cell)}, 사진 {self._mm(pic)}")
-        self._advance(thr, self._caption_for(item))
+        self.log(f"  커서 {pos[0]} → {pos[1]}")
+        moved = self._advance(thr, self._caption_for(item))
+        self.log(f"  다음 사진 칸으로 이동: {'성공' if moved else '실패'} "
+                 f"(현재 {self.ctrl.get_pos()})")
         self._refresh()
 
     @guarded
@@ -1104,7 +1110,7 @@ class App(tk.Tk):
         inserted = 0
         while self.cursor < len(self.photos):
             item = self.photos[self.cursor]
-            cell, pic = self.ctrl.insert_picture_fit(
+            cell, pic, _pos = self.ctrl.insert_picture_fit(
                 item["path"], margins, border, post_adjust=self.var_post_adjust.get())
             self.cursor += 1
             inserted += 1
