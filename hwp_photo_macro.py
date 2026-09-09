@@ -318,15 +318,25 @@ class HwpController:
         hwp = self.hwp
         before = self.get_pos()          # 삽입 전 캐럿 위치를 기억해 둔다
         hwp.Run("ParagraphShapeAlignCenter")
-        try:
-            hwp.InsertPicture(path, True, 2, False, False, 0, w, h)
-        except Exception:
+
+        # sizeoption 3 = width/height 로 지정한 크기.
+        # 2 는 "셀 크기에 맞추어" 라서 우리가 계산한 값을 무시하고 여백이 먹지 않는다.
+        inserted = False
+        for opt in (3, 2):
+            try:
+                hwp.InsertPicture(path, True, opt, False, False, 0, w, h)
+                inserted = True
+                break
+            except Exception:
+                continue
+        if not inserted:
             hwp.InsertPicture(path, True)
         if post_adjust or border_px > 0:
             self._apply_shape(w, h, border_px)
         # 그림이 선택된 채로 남으면 칸 이동이 되지 않으므로 편집 상태로 되돌린다
         self.escape_selection()
         self.set_pos(before)
+        return (cw, ch), (w, h)
 
     def _apply_shape(self, w: int, h: int, border_px: float):
         hwp = self.hwp
@@ -822,6 +832,12 @@ class App(tk.Tk):
         self._update_status()
         self.log(f"현재 문서: {self.ctrl.doc_name()}")
 
+    @staticmethod
+    def _mm(size):
+        """(너비, 높이) HWPUNIT 을 읽기 쉬운 mm 문자열로."""
+        w, h = size
+        return f"{w / HWPUNIT_PER_MM:.0f}x{h / HWPUNIT_PER_MM:.0f}mm"
+
     def _insert_options(self):
         """삽입 옵션(여백/테두리)을 픽셀 단위로 돌려준다.
 
@@ -961,10 +977,11 @@ class App(tk.Tk):
         margins, border = self._insert_options()
         thr, _ = self._plan()
         item = self.photos[self.cursor]
-        self.ctrl.insert_picture_fit(item["path"], margins, border,
-                                     post_adjust=self.var_post_adjust.get())
+        cell, pic = self.ctrl.insert_picture_fit(
+            item["path"], margins, border, post_adjust=self.var_post_adjust.get())
         self.cursor += 1
-        self.log(f"삽입: {os.path.basename(item['path'])}")
+        self.log(f"삽입: {os.path.basename(item['path'])} — "
+                 f"칸 {self._mm(cell)}, 사진 {self._mm(pic)}")
         self._advance(thr, self._caption_for(item))
         self._refresh()
 
@@ -992,11 +1009,12 @@ class App(tk.Tk):
         inserted = 0
         while self.cursor < len(self.photos):
             item = self.photos[self.cursor]
-            self.ctrl.insert_picture_fit(item["path"], margins, border,
-                                     post_adjust=self.var_post_adjust.get())
+            cell, pic = self.ctrl.insert_picture_fit(
+                item["path"], margins, border, post_adjust=self.var_post_adjust.get())
             self.cursor += 1
             inserted += 1
-            self.log(f"삽입 {inserted}: {os.path.basename(item['path'])}")
+            self.log(f"삽입 {inserted}: {os.path.basename(item['path'])} — "
+                     f"칸 {self._mm(cell)}, 사진 {self._mm(pic)}")
             is_last = self.cursor >= len(self.photos)
             moved = self._advance(thr, self._caption_for(item))
             if is_last:
