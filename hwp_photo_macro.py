@@ -311,6 +311,21 @@ class HwpController:
                 addrs.append((int(col.group(1)), int(row.group(1))))
         return addrs
 
+    def key_indicator_raw(self):
+        """KeyIndicator() 가 돌려주는 값을 가공 없이 그대로 돌려준다.
+
+        상태 표시줄에 쓰이는 값이라 COM API 와는 다른 경로일 수 있다.
+        여러 칸이 선택됐을 때 범위 표시가 들어 있는지 확인하기 위함."""
+        self._require()
+        try:
+            ind = self.hwp.KeyIndicator()
+        except Exception as e:
+            return f"실패: {e}"
+        try:
+            return [repr(x) for x in ind]
+        except TypeError:
+            return repr(ind)
+
     def cell_addr(self):
         """현재 커서가 있는 칸의 주소 문자열. 상태 표시줄의 (D5) 와 같은 값."""
         self._require()
@@ -385,6 +400,7 @@ class HwpController:
             report["GetSelectedPos"] = self.hwp.GetSelectedPos()
         except Exception as e:
             report["GetSelectedPos"] = f"실패: {e}"
+        report["KeyIndicator 원본"] = self.key_indicator_raw()
         report["셀 주소(KeyIndicator)"] = self.cell_addr()
         try:
             addrs = self.block_cell_addresses()
