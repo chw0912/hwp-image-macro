@@ -272,7 +272,12 @@ class HwpController:
         셀 블록 상태에서 SetCurFieldName 을 실행하면 선택된 모든 칸에
         같은 이름이 붙는다. 그 이름을 인덱스로 순회해 칸 번호를 모으고
         이름은 지운다. 범위를 추측하지 않으므로 세로 선택이나
-        떨어진 선택도 그대로 처리된다."""
+        떨어진 선택도 그대로 처리된다.
+
+        option 은 반드시 1(hwpFieldCell) 이어야 한다. 공식 매뉴얼의
+        HwpFieldOption 상수이며, 0 을 넣으면 셀 블록 전체가 아니라
+        캐럿이 있는 칸 하나에만 이름이 붙는다. (실측: option=1 → 3칸,
+        option=0 → 1칸)"""
         self._require()
         if not self._set_field_name(name, option):
             return []
