@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# 테스트용 문서·사진 (실수로 올라가지 않도록)
+*.hwp
+*.hwpx
+test/
+sample/
+
+# OS / IDE
+Thumbs.db
+.DS_Store
+.vscode/
+.idea/

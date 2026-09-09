@@ -1,0 +1,718 @@
+# -*- coding: utf-8 -*-
+"""
+사진대지 매크로 (한글 / HWP · HWPX)
+================================================================
+한글 문서의 표에 이미지를 순서대로 자동 삽입하는 프로그램.
+표의 열 수와 캡션 행 유무를 자동으로 감지하므로 양식이 바뀌어도 그대로 쓸 수 있다.
+
+필요 환경 : Windows + 한글(HWP) 설치
+설치      : pip install -r requirements.txt
+실행      : python hwp_photo_macro.py
+배포용 exe: build.bat 실행
+"""
+from __future__ import annotations
+
+import ctypes
+import os
+import re
+import sys
+import threading
+import time
+import tkinter as tk
+from ctypes import wintypes
+from tkinter import filedialog, messagebox, ttk
+
+try:
+    from PIL import Image, ImageTk
+except ImportError:
+    Image = None
+    ImageTk = None
+
+# 한글 내부 단위: 1mm = 283.465 HWPUNIT
+HWPUNIT_PER_MM = 283.465
+IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tif", ".tiff", ".webp")
+MAX_CELL_WALK = 400  # 무한 루프 방지용 상한
+
+
+def natural_key(path: str):
+    """IMG_2.jpg 가 IMG_10.jpg 보다 앞에 오도록 정렬"""
+    name = os.path.basename(path)
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", name)]
+
+
+def split_threshold(values):
+    """1차원 값들을 두 무리로 갈랐을 때의 경계값. 무리가 하나뿐이면 None."""
+    if len(values) < 2:
+        return None
+    lo, hi = min(values), max(values)
+    if hi < lo * 1.6:  # 높이 차이가 크지 않으면 캡션 행이 없는 표로 본다
+        return None
+    c1, c2 = float(lo), float(hi)
+    for _ in range(30):
+        g1 = [v for v in values if abs(v - c1) <= abs(v - c2)]
+        g2 = [v for v in values if abs(v - c1) > abs(v - c2)]
+        if not g1 or not g2:
+            break
+        n1, n2 = sum(g1) / len(g1), sum(g2) / len(g2)
+        if abs(n1 - c1) < 1 and abs(n2 - c2) < 1:
+            break
+        c1, c2 = n1, n2
+    return (c1 + c2) / 2
+
+
+# ==================================================================
+#  한글 제어부
+# ==================================================================
+class HwpError(Exception):
+    pass
+
+
+class HwpController:
+    def __init__(self):
+        self.hwp = None
+
+    @property
+    def connected(self) -> bool:
+        return self.hwp is not None
+
+    def connect(self):
+        try:
+            import win32com.client as win32
+        except ImportError:
+            raise HwpError("pywin32 가 설치되어 있지 않습니다.\n  pip install pywin32")
+
+        try:
+            hwp = win32.gencache.EnsureDispatch("HWPFrame.HwpObject")
+        except Exception:
+            try:
+                hwp = win32.Dispatch("HWPFrame.HwpObject")
+            except Exception as e:
+                raise HwpError(
+                    "한글에 연결하지 못했습니다.\n"
+                    "한글이 실행되어 있고 문서가 열려 있는지 확인해 주세요.\n\n"
+                    f"({e})")
+
+        try:
+            hwp.RegisterModule("FilePathCheckDLL", "FilePathChecker")
+        except Exception:
+            pass
+        try:
+            hwp.XHwpWindows.Item(0).Visible = True
+        except Exception:
+            pass
+
+        self.hwp = hwp
+        return hwp
+
+    def _require(self):
+        if self.hwp is None:
+            raise HwpError("한글에 연결되어 있지 않습니다. [한글 연결]을 먼저 눌러주세요.")
+
+    def doc_name(self) -> str:
+        self._require()
+        try:
+            path = self.hwp.Path
+            return os.path.basename(path) if path else "(저장 안 된 문서)"
+        except Exception:
+            return "(알 수 없음)"
+
+    # ---------------- 셀 정보 ----------------
+    def cell_size(self):
+        """현재 칸의 (안쪽 너비, 안쪽 높이) HWPUNIT. 표 밖이면 None."""
+        self._require()
+        try:
+            cs = self.hwp.CellShape
+        except Exception:
+            return None
+        if cs is None:
+            return None
+
+        def item(key, default=0):
+            try:
+                v = cs.Item(key)
+                return default if v is None else int(v)
+            except Exception:
+                return default
+
+        w, h = item("Width"), item("Height")
+        if w <= 0 or h <= 0:
+            return None
+        w -= item("MarginLeft") + item("MarginRight")
+        h -= item("MarginTop") + item("MarginBottom")
+        return max(w, 1), max(h, 1)
+
+    def in_table(self) -> bool:
+        return self.cell_size() is not None
+
+    def run(self, action: str) -> bool:
+        self._require()
+        try:
+            return bool(self.hwp.Run(action))
+        except Exception:
+            return False
+
+    # ---------------- 표 훑기 ----------------
+    def scan_cells(self):
+        """현재 칸부터 표 끝까지 각 칸의 (너비, 높이)를 모으고 원래 칸으로 복귀."""
+        self._require()
+        sizes, steps = [], 0
+        while len(sizes) < MAX_CELL_WALK:
+            s = self.cell_size()
+            if s is None:
+                break
+            sizes.append(s)
+            if not self.run("TableRightCell"):
+                break
+            steps += 1
+        for _ in range(steps):  # 원위치 복귀
+            self.run("TableLeftCell")
+        return sizes
+
+    # ---------------- 삽입 ----------------
+    def insert_text(self, text: str):
+        self._require()
+        if not text:
+            return
+        act = self.hwp.CreateAction("InsertText")
+        pset = act.CreateSet()
+        act.GetDefault(pset)
+        pset.SetItem("Text", text)
+        act.Execute(pset)
+
+    @staticmethod
+    def _image_ratio(path: str):
+        if Image is None:
+            return 4, 3
+        try:
+            with Image.open(path) as im:
+                return im.size
+        except Exception:
+            return 4, 3
+
+    def insert_picture_fit(self, path: str, margins_mm=(0, 0, 0, 0), border_mm=0.0):
+        """현재 칸 크기에 맞춰 비율을 유지한 채 삽입. margins_mm = (상, 하, 좌, 우)"""
+        self._require()
+        size = self.cell_size()
+        if size is None:
+            raise HwpError("커서가 표 안에 있지 않습니다.")
+
+        cw, ch = size
+        top, bottom, left, right = (int(m * HWPUNIT_PER_MM) for m in margins_mm)
+        avail_w = max(cw - left - right, 1)
+        avail_h = max(ch - top - bottom, 1)
+
+        iw, ih = self._image_ratio(path)
+        scale = min(avail_w / iw, avail_h / ih)
+        w = max(int(iw * scale), 1)
+        h = max(int(ih * scale), 1)
+
+        hwp = self.hwp
+        hwp.Run("ParagraphShapeAlignCenter")
+        try:
+            # (경로, 문서에 포함, 크기옵션, 반전, 워터마크, 효과, 너비, 높이)
+            hwp.InsertPicture(path, True, 2, False, False, 0, w, h)
+        except Exception:
+            hwp.InsertPicture(path, True)
+        # 크기옵션 해석이 버전마다 달라서 삽입 후 한 번 더 명시적으로 지정
+        self._apply_shape(w, h, border_mm)
+
+    def _apply_shape(self, w: int, h: int, border_mm: float):
+        hwp = self.hwp
+        try:
+            hwp.FindCtrl()
+            hwp.HAction.GetDefault("ShapeObjDialog", hwp.HParameterSet.HShapeObject.HSet)
+            so = hwp.HParameterSet.HShapeObject
+            so.Width = w
+            so.Height = h
+            so.TreatAsChar = 1
+            if border_mm > 0:
+                try:
+                    so.LineShape.Type = 1
+                    so.LineShape.Color = 0
+                    so.LineShape.Width = int(border_mm * HWPUNIT_PER_MM)
+                except Exception:
+                    pass
+            hwp.HAction.Execute("ShapeObjDialog", so.HSet)
+        except Exception:
+            pass
+        finally:
+            hwp.Run("Cancel")
+
+
+# ==================================================================
+#  전역 단축키
+# ==================================================================
+WM_HOTKEY = 0x0312
+MOD_CONTROL, MOD_SHIFT = 0x0002, 0x0004
+
+
+class GlobalHotkeys(threading.Thread):
+    def __init__(self, bindings):
+        super().__init__(daemon=True)
+        self.bindings = bindings
+        self._stop = threading.Event()
+
+    def run(self):
+        user32 = ctypes.windll.user32
+        registered = []
+        for hk_id, (mods, vk, _) in self.bindings.items():
+            if user32.RegisterHotKey(None, hk_id, mods, vk):
+                registered.append(hk_id)
+        msg = wintypes.MSG()
+        while not self._stop.is_set():
+            if user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1):
+                if msg.message == WM_HOTKEY:
+                    b = self.bindings.get(msg.wParam)
+                    if b:
+                        b[2]()
+            time.sleep(0.03)
+        for hk_id in registered:
+            user32.UnregisterHotKey(None, hk_id)
+
+    def stop(self):
+        self._stop.set()
+
+
+# ==================================================================
+#  GUI
+# ==================================================================
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("사진대지 매크로 (한글)")
+        self.geometry("900x640")
+        self.minsize(840, 600)
+
+        self.ctrl = HwpController()
+        self.photos = []      # [{"path":..., "caption":...}]
+        self.cursor = 0       # 다음에 넣을 사진 index
+        self._thumb = None
+        self._pending_caption = None  # 자동 모드에서 캡션 칸을 기다리는 상태
+
+        self._build_ui()
+        self._bind_keys()
+        self._start_hotkeys()
+        self._refresh()
+
+    # ---------------- 레이아웃 ----------------
+    def _build_ui(self):
+        root = ttk.Frame(self, padding=8)
+        root.pack(fill="both", expand=True)
+
+        bar = ttk.Frame(root)
+        bar.pack(fill="x", pady=(0, 8))
+        ttk.Button(bar, text="한글 연결", command=self.on_connect, width=12).pack(side="left")
+        self.lbl_status = ttk.Label(bar, text="연결 안 됨", foreground="#b00")
+        self.lbl_status.pack(side="left", padx=10)
+
+        body = ttk.Frame(root)
+        body.pack(fill="both", expand=True)
+
+        # ---- 왼쪽 ----
+        left = ttk.Frame(body)
+        left.pack(side="left", fill="both", expand=True)
+
+        self.canvas = tk.Canvas(left, bg="#1a1a1a", height=250, highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
+
+        list_area = ttk.Frame(left)
+        list_area.pack(fill="both", expand=True, pady=(8, 0))
+
+        self.tree = ttk.Treeview(list_area, columns=("no", "file", "caption"),
+                                 show="headings", height=9)
+        self.tree.heading("no", text="#")
+        self.tree.heading("file", text="파일명")
+        self.tree.heading("caption", text="캡션 (더블클릭 수정)")
+        self.tree.column("no", width=40, anchor="center", stretch=False)
+        self.tree.column("file", width=210)
+        self.tree.column("caption", width=210)
+        self.tree.pack(side="left", fill="both", expand=True)
+        self.tree.bind("<<TreeviewSelect>>", self.on_select)
+        self.tree.bind("<Double-1>", self.on_edit_caption)
+
+        sb = ttk.Scrollbar(list_area, orient="vertical", command=self.tree.yview)
+        sb.pack(side="left", fill="y")
+        self.tree.configure(yscrollcommand=sb.set)
+
+        order = ttk.Frame(list_area)
+        order.pack(side="left", fill="y", padx=4)
+        for label, where in (("▲▲", "top"), ("▲", "up"), ("▼", "down"), ("▼▼", "bottom")):
+            ttk.Button(order, text=label, width=4,
+                       command=lambda w=where: self.move_item(w)).pack(pady=1)
+
+        btns = ttk.Frame(left)
+        btns.pack(fill="x", pady=6)
+        ttk.Button(btns, text="사진 추가", command=self.on_add).pack(side="left")
+        ttk.Button(btns, text="폴더 추가", command=self.on_add_folder).pack(side="left", padx=4)
+        ttk.Button(btns, text="이름순 정렬", command=self.on_sort_by_name).pack(side="left")
+        ttk.Button(btns, text="선택 삭제", command=self.on_remove).pack(side="left", padx=4)
+        ttk.Button(btns, text="모두 삭제", command=self.on_clear).pack(side="left")
+
+        # ---- 오른쪽 ----
+        right = ttk.Frame(body, width=270)
+        right.pack(side="left", fill="y", padx=(10, 0))
+        right.pack_propagate(False)
+
+        form = ttk.LabelFrame(right, text="표 구조", padding=8)
+        form.pack(fill="x")
+        self.var_mode = tk.StringVar(value="auto")
+        ttk.Radiobutton(form, text="자동 감지 (권장)", value="auto",
+                        variable=self.var_mode, command=self._toggle_mode)\
+            .grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(form, text="큰 칸=사진, 작은 칸=캡션으로 판단",
+                  foreground="#666").grid(row=1, column=0, columnspan=2, sticky="w", padx=18)
+
+        ttk.Label(form, text="사진 칸 최소 높이(mm)").grid(row=2, column=0, sticky="w", padx=18, pady=(4, 0))
+        self.var_min_h = tk.DoubleVar(value=0.0)
+        self.sp_min_h = ttk.Spinbox(form, from_=0, to=200, increment=5, width=6,
+                                    textvariable=self.var_min_h)
+        self.sp_min_h.grid(row=2, column=1, sticky="e", pady=(4, 0))
+        ttk.Label(form, text="0 = 자동 계산", foreground="#666")\
+            .grid(row=3, column=0, columnspan=2, sticky="w", padx=18)
+
+        ttk.Radiobutton(form, text="모든 칸에 사진 넣기", value="all",
+                        variable=self.var_mode, command=self._toggle_mode)\
+            .grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+        self.var_caption_on = tk.BooleanVar(value=True)
+        ttk.Checkbutton(form, text="캡션 자동 입력", variable=self.var_caption_on)\
+            .grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.var_auto_caption = tk.BooleanVar(value=False)
+        ttk.Checkbutton(form, text="캡션 비면 파일명 사용", variable=self.var_auto_caption)\
+            .grid(row=6, column=0, columnspan=2, sticky="w")
+
+        opt = ttk.LabelFrame(right, text="여백 (mm)", padding=8)
+        opt.pack(fill="x", pady=8)
+        self.var_margin = {}
+        for i, key in enumerate(("상", "하", "좌", "우")):
+            ttk.Label(opt, text=key).grid(row=i, column=0, sticky="w", pady=1)
+            v = tk.DoubleVar(value=1.0)
+            self.var_margin[key] = v
+            ttk.Spinbox(opt, from_=0, to=30, increment=0.5, width=8, textvariable=v)\
+                .grid(row=i, column=1, sticky="e")
+
+        bd = ttk.LabelFrame(right, text="테두리", padding=8)
+        bd.pack(fill="x")
+        self.var_border_on = tk.BooleanVar(value=False)
+        ttk.Checkbutton(bd, text="사진 테두리", variable=self.var_border_on)\
+            .grid(row=0, column=0, sticky="w")
+        self.var_border_mm = tk.DoubleVar(value=0.2)
+        ttk.Spinbox(bd, from_=0.1, to=3.0, increment=0.1, width=6,
+                    textvariable=self.var_border_mm).grid(row=0, column=1, sticky="e")
+
+        act = ttk.Frame(right)
+        act.pack(fill="x", pady=12)
+        ttk.Button(act, text="한 장 넣기  (Ctrl+Q)", command=self.on_insert_one).pack(fill="x", pady=2)
+        ttk.Button(act, text="한번에 넣기  (Ctrl+Shift+A)", command=self.on_insert_all).pack(fill="x", pady=2)
+        ttk.Button(act, text="표 구조 확인", command=self.on_check_table).pack(fill="x", pady=2)
+        ttk.Button(act, text="넣을 위치 처음으로", command=self.on_reset_cursor).pack(fill="x", pady=2)
+
+        self.lbl_progress = ttk.Label(right, text="", foreground="#555", wraplength=250)
+        self.lbl_progress.pack(fill="x")
+        self._toggle_mode()
+
+    def _toggle_mode(self):
+        state = "normal" if self.var_mode.get() == "auto" else "disabled"
+        self.sp_min_h.configure(state=state)
+
+    def _bind_keys(self):
+        self.bind("<Control-q>", lambda e: self.on_insert_one())
+        self.bind("<Control-Shift-A>", lambda e: self.on_insert_all())
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def _start_hotkeys(self):
+        self.hotkeys = None
+        if sys.platform != "win32":
+            return
+        try:
+            self.hotkeys = GlobalHotkeys({
+                1: (MOD_CONTROL, ord("Q"), lambda: self.after(0, self.on_insert_one)),
+                2: (MOD_CONTROL | MOD_SHIFT, ord("A"), lambda: self.after(0, self.on_insert_all)),
+            })
+            self.hotkeys.start()
+        except Exception:
+            self.hotkeys = None
+
+    # ---------------- 목록 ----------------
+    def _refresh(self):
+        for iid in self.tree.get_children():
+            self.tree.delete(iid)
+        for i, p in enumerate(self.photos):
+            mark = "✔" if i < self.cursor else str(i + 1)
+            self.tree.insert("", "end", iid=str(i),
+                             values=(mark, os.path.basename(p["path"]), p["caption"]))
+        total = len(self.photos)
+        self.lbl_progress.config(
+            text=f"{self.cursor} / {total} 장 삽입됨" if total else "사진을 추가해 주세요.")
+
+    def _selected_index(self):
+        sel = self.tree.selection()
+        return int(sel[0]) if sel else None
+
+    def on_add(self):
+        paths = filedialog.askopenfilenames(
+            title="사진 선택",
+            filetypes=[("이미지", " ".join("*" + e for e in IMAGE_EXTS)), ("모든 파일", "*.*")])
+        # 정렬하지 않고 선택한 순서 그대로 추가한다
+        self._add_paths(paths)
+
+    def on_add_folder(self):
+        folder = filedialog.askdirectory(title="사진 폴더 선택")
+        if not folder:
+            return
+        paths = [os.path.join(folder, f) for f in os.listdir(folder)
+                 if f.lower().endswith(IMAGE_EXTS)]
+        self._add_paths(sorted(paths, key=natural_key))
+
+    def _add_paths(self, paths):
+        existing = {p["path"] for p in self.photos}
+        for p in paths:
+            if p not in existing:
+                self.photos.append({"path": p, "caption": ""})
+        self._refresh()
+
+    def on_sort_by_name(self):
+        """필요할 때만 이름순으로 다시 정렬한다."""
+        if not self.photos:
+            return
+        self.photos.sort(key=lambda p: natural_key(p["path"]))
+        self.cursor = 0
+        self._refresh()
+
+    def on_remove(self):
+        idx = self._selected_index()
+        if idx is None:
+            return
+        self.photos.pop(idx)
+        self.cursor = min(self.cursor, len(self.photos))
+        self._refresh()
+
+    def on_clear(self):
+        if self.photos and messagebox.askyesno("확인", "목록을 모두 지울까요?"):
+            self.photos.clear()
+            self.cursor = 0
+            self.canvas.delete("all")
+            self._refresh()
+
+    def move_item(self, where):
+        i = self._selected_index()
+        if i is None:
+            return
+        item = self.photos.pop(i)
+        j = {"top": 0, "up": max(i - 1, 0),
+             "down": min(i + 1, len(self.photos)), "bottom": len(self.photos)}[where]
+        self.photos.insert(j, item)
+        self._refresh()
+        self.tree.selection_set(str(j))
+
+    def on_select(self, _=None):
+        i = self._selected_index()
+        if i is not None:
+            self._show_preview(self.photos[i]["path"])
+
+    def _show_preview(self, path):
+        self.canvas.delete("all")
+        if Image is None:
+            self.canvas.create_text(10, 10, anchor="nw", fill="#aaa",
+                                    text="Pillow 미설치 — 미리보기 불가")
+            return
+        cw = self.canvas.winfo_width() or 400
+        ch = self.canvas.winfo_height() or 250
+        try:
+            with Image.open(path) as im:
+                im = im.copy()
+                im.thumbnail((cw - 10, ch - 10))
+                self._thumb = ImageTk.PhotoImage(im)
+            self.canvas.create_image(cw // 2, ch // 2, image=self._thumb)
+        except Exception as e:
+            self.canvas.create_text(10, 10, anchor="nw", fill="#f66", text=f"미리보기 실패: {e}")
+
+    def on_edit_caption(self, event):
+        row = self.tree.identify_row(event.y)
+        if not row or self.tree.identify_column(event.x) != "#3":
+            return
+        i = int(row)
+        x, y, w, h = self.tree.bbox(row, "caption")
+        entry = ttk.Entry(self.tree)
+        entry.place(x=x, y=y, width=w, height=h)
+        entry.insert(0, self.photos[i]["caption"])
+        entry.focus_set()
+
+        def commit(_=None):
+            self.photos[i]["caption"] = entry.get()
+            entry.destroy()
+            self._refresh()
+            self.tree.selection_set(row)
+
+        entry.bind("<Return>", commit)
+        entry.bind("<FocusOut>", commit)
+        entry.bind("<Escape>", lambda e: entry.destroy())
+
+    # ---------------- 한글 연동 ----------------
+    def on_connect(self):
+        try:
+            self.ctrl.connect()
+        except HwpError as e:
+            messagebox.showerror("연결 실패", str(e))
+            return
+        self.lbl_status.config(text=f"연결됨 — {self.ctrl.doc_name()}", foreground="#070")
+
+    def _options(self):
+        m = self.var_margin
+        margins = (m["상"].get(), m["하"].get(), m["좌"].get(), m["우"].get())
+        border = self.var_border_mm.get() if self.var_border_on.get() else 0.0
+        return margins, border
+
+    def _plan(self):
+        """표를 한 번 훑어서 (사진 칸 기준 높이, 남은 사진 칸 개수)를 계산한다."""
+        sizes = self.ctrl.scan_cells()
+        if not sizes:
+            raise HwpError("커서가 표 안에 있지 않습니다.\n"
+                           "한글에서 사진을 넣을 칸을 클릭한 뒤 다시 시도해 주세요.")
+        if self.var_mode.get() == "all":
+            thr = 0
+        elif self.var_min_h.get() > 0:
+            thr = int(self.var_min_h.get() * HWPUNIT_PER_MM)
+        else:
+            t = split_threshold([h for _, h in sizes])
+            thr = int(t) if t else 0
+        available = sum(1 for _, h in sizes if h >= thr)
+        return thr, available
+
+    def _caption_for(self, item):
+        if not self.var_caption_on.get():
+            return ""
+        if item["caption"]:
+            return item["caption"]
+        if self.var_auto_caption.get():
+            return os.path.splitext(os.path.basename(item["path"]))[0]
+        return ""
+
+    def on_check_table(self):
+        """커서 위치부터 표를 훑어 감지 결과를 보여준다."""
+        if not self.ctrl.connected:
+            messagebox.showwarning("안내", "먼저 [한글 연결]을 눌러주세요.")
+            return
+        try:
+            sizes = self.ctrl.scan_cells()
+            thr, available = self._plan()
+        except HwpError as e:
+            messagebox.showwarning("안내", str(e))
+            return
+        heights = sorted({round(h / HWPUNIT_PER_MM) for _, h in sizes})
+        remaining = len(self.photos) - self.cursor
+        verdict = ""
+        if remaining:
+            if available >= remaining:
+                verdict = f"\n\n넣을 사진 {remaining}장 → 칸이 충분합니다."
+            else:
+                verdict = (f"\n\n넣을 사진 {remaining}장 → 칸이 {remaining - available}개 부족합니다.\n"
+                           f"표(페이지)를 더 만들어 두거나, 나눠서 넣으셔야 합니다.")
+        messagebox.showinfo(
+            "표 구조 확인",
+            f"커서 위치부터 남은 칸 : {len(sizes)}개\n"
+            f"사진 칸으로 판단된 칸 : {available}개\n"
+            f"기준 높이 : {thr / HWPUNIT_PER_MM:.0f}mm\n"
+            f"칸 높이 종류 : {heights}mm"
+            f"{verdict}\n\n"
+            "결과가 맞지 않으면 [사진 칸 최소 높이]를 직접 지정해 보세요.")
+
+    def on_reset_cursor(self):
+        self.cursor = 0
+        self._refresh()
+
+    def _ready(self) -> bool:
+        if not self.ctrl.connected:
+            messagebox.showwarning("안내", "먼저 [한글 연결]을 눌러주세요.")
+            return False
+        if not self.photos:
+            messagebox.showwarning("안내", "사진 목록이 비어 있습니다.")
+            return False
+        if self.cursor >= len(self.photos):
+            messagebox.showinfo("안내", "모든 사진을 넣었습니다.")
+            return False
+        return True
+
+    def on_insert_one(self):
+        """현재 칸에 한 장 넣고, 다음 사진 칸까지 커서를 옮긴다."""
+        if not self._ready():
+            return
+        margins, border = self._options()
+        try:
+            thr, _ = self._plan()
+            item = self.photos[self.cursor]
+            self.ctrl.insert_picture_fit(item["path"], margins, border)
+            self.cursor += 1
+            caption = self._caption_for(item)
+            self._advance(thr, caption)
+        except HwpError as e:
+            messagebox.showwarning("삽입 실패", str(e))
+        except Exception as e:
+            messagebox.showerror("오류", f"삽입 중 오류가 발생했습니다.\n\n{e}")
+        self._refresh()
+
+    def _advance(self, thr: int, pending_caption: str) -> bool:
+        """다음 사진 칸까지 이동. 도중의 작은 칸에 캡션을 쓴다. 표 끝이면 False."""
+        for _ in range(MAX_CELL_WALK):
+            if not self.ctrl.run("TableRightCell"):
+                return False
+            size = self.ctrl.cell_size()
+            if size is None:
+                return False
+            if size[1] >= thr:      # 사진 칸 도착
+                return True
+            if pending_caption:     # 캡션 칸
+                self.ctrl.insert_text(pending_caption)
+                pending_caption = ""
+        return False
+
+    def on_insert_all(self):
+        if not self._ready():
+            return
+        margins, border = self._options()
+        inserted = 0
+        try:
+            thr, available = self._plan()
+            remaining = len(self.photos) - self.cursor
+            if available < remaining:
+                go = messagebox.askyesno(
+                    "칸이 부족합니다",
+                    f"이 표에 남은 사진 칸 : {available}개\n"
+                    f"넣어야 할 사진 : {remaining}장\n"
+                    f"→ {remaining - available}장이 들어가지 못합니다.\n\n"
+                    "지금 넣으면 칸이 찰 때까지만 채우고 멈춥니다.\n"
+                    "남은 사진은 목록에 그대로 남으니, 페이지를 추가한 뒤\n"
+                    "다음 표의 첫 칸을 클릭하고 다시 누르면 이어집니다.\n\n"
+                    "이대로 진행할까요?")
+                if not go:
+                    return
+            while self.cursor < len(self.photos):
+                item = self.photos[self.cursor]
+                self.ctrl.insert_picture_fit(item["path"], margins, border)
+                self.cursor += 1
+                inserted += 1
+                is_last = self.cursor >= len(self.photos)
+                moved = self._advance(thr, self._caption_for(item))
+                if is_last:
+                    break
+                if not moved:
+                    messagebox.showinfo(
+                        "표 끝에 도달",
+                        f"{inserted}장을 넣고 표가 끝났습니다.\n"
+                        f"다음 표의 첫 사진 칸에 커서를 놓고 다시 [한번에 넣기]를 누르세요.\n"
+                        f"(남은 사진 {len(self.photos) - self.cursor}장)")
+                    break
+        except HwpError as e:
+            messagebox.showwarning("삽입 중단", str(e))
+        except Exception as e:
+            messagebox.showerror("오류", f"삽입 중 오류가 발생했습니다.\n\n{e}")
+        self._refresh()
+
+    def on_close(self):
+        if self.hotkeys:
+            self.hotkeys.stop()
+        self.destroy()
+
+
+if __name__ == "__main__":
+    App().mainloop()
