@@ -3,24 +3,26 @@
 사진대지 매크로 (한글 / HWP · HWPX)
 ================================================================
 한글 문서의 표에 이미지를 순서대로 자동 삽입하는 프로그램.
-표의 열 수와 캡션 행 유무를 자동으로 감지하므로 양식이 바뀌어도 그대로 쓸 수 있다.
+표의 열 수와 캡션 행 유무를 스스로 감지한다.
 
 필요 환경 : Windows + 한글(HWP) 설치
 설치      : pip install -r requirements.txt
 실행      : python hwp_photo_macro.py
-배포용 exe: build.bat 실행
 """
 from __future__ import annotations
 
 import ctypes
+import functools
 import os
 import re
 import sys
 import threading
 import time
 import tkinter as tk
+import traceback
 from ctypes import wintypes
-from tkinter import filedialog, messagebox, ttk
+from datetime import datetime
+from tkinter import filedialog, messagebox, ttk, scrolledtext
 
 try:
     from PIL import Image, ImageTk
@@ -31,11 +33,20 @@ except ImportError:
 # 한글 내부 단위: 1mm = 283.465 HWPUNIT
 HWPUNIT_PER_MM = 283.465
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tif", ".tiff", ".webp")
-MAX_CELL_WALK = 400  # 무한 루프 방지용 상한
+MAX_CELL_WALK = 400
+
+
+def app_dir() -> str:
+    """exe 로 묶였을 때도 올바른 폴더를 돌려준다."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+LOG_FILE = os.path.join(app_dir(), "error_log.txt")
 
 
 def natural_key(path: str):
-    """IMG_2.jpg 가 IMG_10.jpg 보다 앞에 오도록 정렬"""
     name = os.path.basename(path)
     return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", name)]
 
@@ -45,7 +56,7 @@ def split_threshold(values):
     if len(values) < 2:
         return None
     lo, hi = min(values), max(values)
-    if hi < lo * 1.6:  # 높이 차이가 크지 않으면 캡션 행이 없는 표로 본다
+    if hi < lo * 1.6:
         return None
     c1, c2 = float(lo), float(hi)
     for _ in range(30):
@@ -64,7 +75,7 @@ def split_threshold(values):
 #  한글 제어부
 # ==================================================================
 class HwpError(Exception):
-    pass
+    """사용자에게 그대로 보여줄 수 있는, 예상된 오류."""
 
 
 class HwpController:
@@ -76,21 +87,33 @@ class HwpController:
         return self.hwp is not None
 
     def connect(self):
+        """이미 실행 중인 한글에 먼저 붙어보고, 없으면 새로 띄운다."""
         try:
             import win32com.client as win32
         except ImportError:
             raise HwpError("pywin32 가 설치되어 있지 않습니다.\n  pip install pywin32")
 
+        hwp, attached = None, False
+
+        # 1) 이미 열려 있는 한글에 붙기
         try:
-            hwp = win32.gencache.EnsureDispatch("HWPFrame.HwpObject")
+            hwp = win32.GetActiveObject("HWPFrame.HwpObject")
+            attached = True
         except Exception:
+            hwp = None
+
+        # 2) 실패하면 새 인스턴스
+        if hwp is None:
             try:
-                hwp = win32.Dispatch("HWPFrame.HwpObject")
-            except Exception as e:
-                raise HwpError(
-                    "한글에 연결하지 못했습니다.\n"
-                    "한글이 실행되어 있고 문서가 열려 있는지 확인해 주세요.\n\n"
-                    f"({e})")
+                hwp = win32.gencache.EnsureDispatch("HWPFrame.HwpObject")
+            except Exception:
+                try:
+                    hwp = win32.Dispatch("HWPFrame.HwpObject")
+                except Exception as e:
+                    raise HwpError(
+                        "한글에 연결하지 못했습니다.\n"
+                        "한글이 설치되어 있는지 확인해 주세요.\n\n"
+                        f"({e})")
 
         try:
             hwp.RegisterModule("FilePathCheckDLL", "FilePathChecker")
@@ -102,19 +125,34 @@ class HwpController:
             pass
 
         self.hwp = hwp
-        return hwp
+        return attached
 
     def _require(self):
         if self.hwp is None:
             raise HwpError("한글에 연결되어 있지 않습니다. [한글 연결]을 먼저 눌러주세요.")
 
-    def doc_name(self) -> str:
+    def open_document(self, path: str):
+        """지정한 문서를 열어 작업 대상으로 삼는다."""
+        self._require()
+        last = None
+        for args in ((path,), (path, "", "forceopen:true"), (path, "", "")):
+            try:
+                self.hwp.Open(*args)
+                return
+            except Exception as e:
+                last = e
+        raise HwpError(f"문서를 열지 못했습니다.\n{path}\n\n({last})")
+
+    def doc_path(self) -> str:
         self._require()
         try:
-            path = self.hwp.Path
-            return os.path.basename(path) if path else "(저장 안 된 문서)"
+            return self.hwp.Path or ""
         except Exception:
-            return "(알 수 없음)"
+            return ""
+
+    def doc_name(self) -> str:
+        p = self.doc_path()
+        return os.path.basename(p) if p else "(저장되지 않은 빈 문서)"
 
     # ---------------- 셀 정보 ----------------
     def cell_size(self):
@@ -164,7 +202,7 @@ class HwpController:
             if not self.run("TableRightCell"):
                 break
             steps += 1
-        for _ in range(steps):  # 원위치 복귀
+        for _ in range(steps):
             self.run("TableLeftCell")
         return sizes
 
@@ -192,9 +230,12 @@ class HwpController:
     def insert_picture_fit(self, path: str, margins_mm=(0, 0, 0, 0), border_mm=0.0):
         """현재 칸 크기에 맞춰 비율을 유지한 채 삽입. margins_mm = (상, 하, 좌, 우)"""
         self._require()
+        if not os.path.exists(path):
+            raise HwpError(f"사진 파일을 찾을 수 없습니다.\n{path}")
         size = self.cell_size()
         if size is None:
-            raise HwpError("커서가 표 안에 있지 않습니다.")
+            raise HwpError("커서가 표 안에 있지 않습니다.\n"
+                           "한글 문서에서 사진을 넣을 칸을 클릭한 뒤 다시 시도해 주세요.")
 
         cw, ch = size
         top, bottom, left, right = (int(m * HWPUNIT_PER_MM) for m in margins_mm)
@@ -209,11 +250,9 @@ class HwpController:
         hwp = self.hwp
         hwp.Run("ParagraphShapeAlignCenter")
         try:
-            # (경로, 문서에 포함, 크기옵션, 반전, 워터마크, 효과, 너비, 높이)
             hwp.InsertPicture(path, True, 2, False, False, 0, w, h)
         except Exception:
             hwp.InsertPicture(path, True)
-        # 크기옵션 해석이 버전마다 달라서 삽입 후 한 번 더 명시적으로 지정
         self._apply_shape(w, h, border_mm)
 
     def _apply_shape(self, w: int, h: int, border_mm: float):
@@ -253,24 +292,60 @@ class GlobalHotkeys(threading.Thread):
         self._stop = threading.Event()
 
     def run(self):
-        user32 = ctypes.windll.user32
+        try:
+            user32 = ctypes.windll.user32
+        except Exception:
+            return
         registered = []
         for hk_id, (mods, vk, _) in self.bindings.items():
-            if user32.RegisterHotKey(None, hk_id, mods, vk):
-                registered.append(hk_id)
+            try:
+                if user32.RegisterHotKey(None, hk_id, mods, vk):
+                    registered.append(hk_id)
+            except Exception:
+                pass
         msg = wintypes.MSG()
         while not self._stop.is_set():
-            if user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1):
-                if msg.message == WM_HOTKEY:
-                    b = self.bindings.get(msg.wParam)
-                    if b:
-                        b[2]()
+            try:
+                if user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1):
+                    if msg.message == WM_HOTKEY:
+                        b = self.bindings.get(msg.wParam)
+                        if b:
+                            b[2]()
+            except Exception:
+                pass
             time.sleep(0.03)
         for hk_id in registered:
-            user32.UnregisterHotKey(None, hk_id)
+            try:
+                user32.UnregisterHotKey(None, hk_id)
+            except Exception:
+                pass
 
     def stop(self):
         self._stop.set()
+
+
+# ==================================================================
+#  오류를 눈에 보이게 만드는 장치
+# ==================================================================
+def guarded(func):
+    """버튼 동작에서 터진 예외를 로그와 창으로 드러낸다.
+    이게 없으면 windowed exe 에서는 아무 일도 안 일어난 것처럼 보인다."""
+    @functools.wraps(func)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return func(self, *args, **kwargs)
+        except HwpError as e:
+            self.log(f"[안내] {e}")
+            messagebox.showwarning("안내", str(e), parent=self)
+        except Exception as e:
+            tb = traceback.format_exc()
+            self.log(f"[오류] {func.__name__}\n{tb}")
+            messagebox.showerror(
+                "오류",
+                f"{type(e).__name__}: {e}\n\n"
+                f"자세한 내용을 아래 파일에 기록했습니다.\n{LOG_FILE}",
+                parent=self)
+    return wrapper
 
 
 # ==================================================================
@@ -280,19 +355,39 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("사진대지 매크로 (한글)")
-        self.geometry("900x640")
-        self.minsize(840, 600)
+        self.geometry("940x720")
+        self.minsize(880, 640)
 
         self.ctrl = HwpController()
-        self.photos = []      # [{"path":..., "caption":...}]
-        self.cursor = 0       # 다음에 넣을 사진 index
+        self.photos = []
+        self.cursor = 0
         self._thumb = None
-        self._pending_caption = None  # 자동 모드에서 캡션 칸을 기다리는 상태
 
         self._build_ui()
         self._bind_keys()
         self._start_hotkeys()
         self._refresh()
+        self.log("프로그램을 시작했습니다.")
+        if Image is None:
+            self.log("[경고] Pillow 를 불러오지 못해 미리보기가 꺼졌습니다.")
+
+    # ---------------- 로그 ----------------
+    def log(self, message: str):
+        stamp = datetime.now().strftime("%H:%M:%S")
+        line = f"[{stamp}] {message}\n"
+        try:
+            self.txt_log.configure(state="normal")
+            self.txt_log.insert("end", line)
+            self.txt_log.see("end")
+            self.txt_log.configure(state="disabled")
+        except Exception:
+            pass
+        if message.startswith("[오류]"):
+            try:
+                with open(LOG_FILE, "a", encoding="utf-8") as f:
+                    f.write(f"\n===== {datetime.now():%Y-%m-%d %H:%M:%S} =====\n{message}\n")
+            except Exception:
+                pass
 
     # ---------------- 레이아웃 ----------------
     def _build_ui(self):
@@ -301,7 +396,9 @@ class App(tk.Tk):
 
         bar = ttk.Frame(root)
         bar.pack(fill="x", pady=(0, 8))
-        ttk.Button(bar, text="한글 연결", command=self.on_connect, width=12).pack(side="left")
+        ttk.Button(bar, text="한글 연결", command=self.on_connect, width=11).pack(side="left")
+        ttk.Button(bar, text="문서 열기", command=self.on_open_doc, width=11).pack(side="left", padx=4)
+        ttk.Button(bar, text="문서 다시 확인", command=self.on_refresh_doc, width=13).pack(side="left")
         self.lbl_status = ttk.Label(bar, text="연결 안 됨", foreground="#b00")
         self.lbl_status.pack(side="left", padx=10)
 
@@ -312,14 +409,14 @@ class App(tk.Tk):
         left = ttk.Frame(body)
         left.pack(side="left", fill="both", expand=True)
 
-        self.canvas = tk.Canvas(left, bg="#1a1a1a", height=250, highlightthickness=0)
+        self.canvas = tk.Canvas(left, bg="#1a1a1a", height=230, highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
 
         list_area = ttk.Frame(left)
         list_area.pack(fill="both", expand=True, pady=(8, 0))
 
         self.tree = ttk.Treeview(list_area, columns=("no", "file", "caption"),
-                                 show="headings", height=9)
+                                 show="headings", height=8)
         self.tree.heading("no", text="#")
         self.tree.heading("file", text="파일명")
         self.tree.heading("caption", text="캡션 (더블클릭 수정)")
@@ -348,6 +445,11 @@ class App(tk.Tk):
         ttk.Button(btns, text="선택 삭제", command=self.on_remove).pack(side="left", padx=4)
         ttk.Button(btns, text="모두 삭제", command=self.on_clear).pack(side="left")
 
+        ttk.Label(left, text="진행 기록").pack(anchor="w", pady=(6, 0))
+        self.txt_log = scrolledtext.ScrolledText(left, height=7, state="disabled",
+                                                 font=("Consolas", 9), wrap="word")
+        self.txt_log.pack(fill="x")
+
         # ---- 오른쪽 ----
         right = ttk.Frame(body, width=270)
         right.pack(side="left", fill="y", padx=(10, 0))
@@ -359,17 +461,16 @@ class App(tk.Tk):
         ttk.Radiobutton(form, text="자동 감지 (권장)", value="auto",
                         variable=self.var_mode, command=self._toggle_mode)\
             .grid(row=0, column=0, columnspan=2, sticky="w")
-        ttk.Label(form, text="큰 칸=사진, 작은 칸=캡션으로 판단",
+        ttk.Label(form, text="큰 칸=사진, 작은 칸=캡션",
                   foreground="#666").grid(row=1, column=0, columnspan=2, sticky="w", padx=18)
-
-        ttk.Label(form, text="사진 칸 최소 높이(mm)").grid(row=2, column=0, sticky="w", padx=18, pady=(4, 0))
+        ttk.Label(form, text="사진 칸 최소 높이(mm)").grid(row=2, column=0, sticky="w",
+                                                    padx=18, pady=(4, 0))
         self.var_min_h = tk.DoubleVar(value=0.0)
         self.sp_min_h = ttk.Spinbox(form, from_=0, to=200, increment=5, width=6,
                                     textvariable=self.var_min_h)
         self.sp_min_h.grid(row=2, column=1, sticky="e", pady=(4, 0))
         ttk.Label(form, text="0 = 자동 계산", foreground="#666")\
             .grid(row=3, column=0, columnspan=2, sticky="w", padx=18)
-
         ttk.Radiobutton(form, text="모든 칸에 사진 넣기", value="all",
                         variable=self.var_mode, command=self._toggle_mode)\
             .grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
@@ -412,8 +513,7 @@ class App(tk.Tk):
         self._toggle_mode()
 
     def _toggle_mode(self):
-        state = "normal" if self.var_mode.get() == "auto" else "disabled"
-        self.sp_min_h.configure(state=state)
+        self.sp_min_h.configure(state="normal" if self.var_mode.get() == "auto" else "disabled")
 
     def _bind_keys(self):
         self.bind("<Control-q>", lambda e: self.on_insert_one())
@@ -449,51 +549,75 @@ class App(tk.Tk):
         sel = self.tree.selection()
         return int(sel[0]) if sel else None
 
+    @guarded
     def on_add(self):
-        paths = filedialog.askopenfilenames(
+        chosen = filedialog.askopenfilenames(
+            parent=self,
             title="사진 선택",
-            filetypes=[("이미지", " ".join("*" + e for e in IMAGE_EXTS)), ("모든 파일", "*.*")])
-        # 정렬하지 않고 선택한 순서 그대로 추가한다
+            filetypes=[("이미지 파일", ("*.jpg", "*.jpeg", "*.png", "*.bmp",
+                                    "*.gif", "*.tif", "*.tiff", "*.webp")),
+                       ("모든 파일", "*.*")])
+        # Windows 에서 문자열 하나로 돌아오는 경우가 있어 splitlist 로 풀어준다
+        paths = list(self.tk.splitlist(chosen)) if chosen else []
+        self.log(f"사진 선택: {len(paths)}개")
         self._add_paths(paths)
 
+    @guarded
     def on_add_folder(self):
-        folder = filedialog.askdirectory(title="사진 폴더 선택")
+        folder = filedialog.askdirectory(parent=self, title="사진 폴더 선택")
         if not folder:
+            self.log("폴더 선택을 취소했습니다.")
             return
-        paths = [os.path.join(folder, f) for f in os.listdir(folder)
-                 if f.lower().endswith(IMAGE_EXTS)]
-        self._add_paths(sorted(paths, key=natural_key))
+        names = [f for f in os.listdir(folder) if f.lower().endswith(IMAGE_EXTS)]
+        paths = sorted((os.path.join(folder, f) for f in names), key=natural_key)
+        self.log(f"폴더 선택: {folder} — 이미지 {len(paths)}개")
+        if not paths:
+            messagebox.showinfo("안내", "폴더 안에 이미지 파일이 없습니다.", parent=self)
+            return
+        self._add_paths(paths)
 
     def _add_paths(self, paths):
         existing = {p["path"] for p in self.photos}
+        added = 0
         for p in paths:
             if p not in existing:
                 self.photos.append({"path": p, "caption": ""})
+                existing.add(p)
+                added += 1
         self._refresh()
+        self.log(f"목록에 {added}장 추가 (전체 {len(self.photos)}장)")
+        if added and self.tree.get_children():
+            self.tree.selection_set(str(len(self.photos) - added))
 
+    @guarded
     def on_sort_by_name(self):
-        """필요할 때만 이름순으로 다시 정렬한다."""
         if not self.photos:
             return
         self.photos.sort(key=lambda p: natural_key(p["path"]))
         self.cursor = 0
         self._refresh()
+        self.log("이름순으로 정렬했습니다.")
 
+    @guarded
     def on_remove(self):
         idx = self._selected_index()
         if idx is None:
+            messagebox.showinfo("안내", "목록에서 삭제할 사진을 먼저 선택해 주세요.", parent=self)
             return
         self.photos.pop(idx)
         self.cursor = min(self.cursor, len(self.photos))
         self._refresh()
 
+    @guarded
     def on_clear(self):
-        if self.photos and messagebox.askyesno("확인", "목록을 모두 지울까요?"):
+        if self.photos and messagebox.askyesno("확인", "목록을 모두 지울까요?", parent=self):
             self.photos.clear()
             self.cursor = 0
             self.canvas.delete("all")
             self._refresh()
+            self.log("목록을 비웠습니다.")
 
+    @guarded
     def move_item(self, where):
         i = self._selected_index()
         if i is None:
@@ -517,22 +641,26 @@ class App(tk.Tk):
                                     text="Pillow 미설치 — 미리보기 불가")
             return
         cw = self.canvas.winfo_width() or 400
-        ch = self.canvas.winfo_height() or 250
+        ch = self.canvas.winfo_height() or 230
         try:
             with Image.open(path) as im:
                 im = im.copy()
-                im.thumbnail((cw - 10, ch - 10))
+                im.thumbnail((max(cw - 10, 50), max(ch - 10, 50)))
                 self._thumb = ImageTk.PhotoImage(im)
             self.canvas.create_image(cw // 2, ch // 2, image=self._thumb)
         except Exception as e:
             self.canvas.create_text(10, 10, anchor="nw", fill="#f66", text=f"미리보기 실패: {e}")
 
+    @guarded
     def on_edit_caption(self, event):
         row = self.tree.identify_row(event.y)
         if not row or self.tree.identify_column(event.x) != "#3":
             return
         i = int(row)
-        x, y, w, h = self.tree.bbox(row, "caption")
+        box = self.tree.bbox(row, "caption")
+        if not box:
+            return
+        x, y, w, h = box
         entry = ttk.Entry(self.tree)
         entry.place(x=x, y=y, width=w, height=h)
         entry.insert(0, self.photos[i]["caption"])
@@ -549,13 +677,55 @@ class App(tk.Tk):
         entry.bind("<Escape>", lambda e: entry.destroy())
 
     # ---------------- 한글 연동 ----------------
-    def on_connect(self):
-        try:
-            self.ctrl.connect()
-        except HwpError as e:
-            messagebox.showerror("연결 실패", str(e))
+    def _update_status(self):
+        if not self.ctrl.connected:
+            self.lbl_status.config(text="연결 안 됨", foreground="#b00")
             return
-        self.lbl_status.config(text=f"연결됨 — {self.ctrl.doc_name()}", foreground="#070")
+        name = self.ctrl.doc_name()
+        saved = bool(self.ctrl.doc_path())
+        self.lbl_status.config(text=f"작업 대상: {name}",
+                               foreground="#070" if saved else "#c60")
+
+    @guarded
+    def on_connect(self):
+        attached = self.ctrl.connect()
+        self._update_status()
+        if attached:
+            self.log(f"실행 중인 한글에 연결했습니다. 현재 문서: {self.ctrl.doc_name()}")
+        else:
+            self.log("한글을 새로 실행했습니다.")
+        if not self.ctrl.doc_path():
+            self.log("작업할 문서가 지정되지 않았습니다. [문서 열기]로 양식 파일을 골라주세요.")
+            messagebox.showinfo(
+                "문서를 골라주세요",
+                "작업할 문서가 아직 지정되지 않았습니다.\n"
+                "[문서 열기] 를 눌러 사진대지 양식 파일을 선택해 주세요.",
+                parent=self)
+
+    @guarded
+    def on_open_doc(self):
+        if not self.ctrl.connected:
+            self.ctrl.connect()
+            self.log("한글에 연결했습니다.")
+        path = filedialog.askopenfilename(
+            parent=self,
+            title="작업할 한글 문서 선택",
+            filetypes=[("한글 문서", ("*.hwp", "*.hwpx")), ("모든 파일", "*.*")])
+        if not path:
+            self.log("문서 선택을 취소했습니다.")
+            return
+        self.ctrl.open_document(path)
+        self._update_status()
+        self.log(f"문서를 열었습니다: {os.path.basename(path)}")
+
+    @guarded
+    def on_refresh_doc(self):
+        """한글에서 다른 문서로 바꿔 작업할 때 현재 문서를 다시 읽는다."""
+        if not self.ctrl.connected:
+            messagebox.showinfo("안내", "먼저 [한글 연결]을 눌러주세요.", parent=self)
+            return
+        self._update_status()
+        self.log(f"현재 문서: {self.ctrl.doc_name()}")
 
     def _options(self):
         m = self.var_margin
@@ -564,11 +734,11 @@ class App(tk.Tk):
         return margins, border
 
     def _plan(self):
-        """표를 한 번 훑어서 (사진 칸 기준 높이, 남은 사진 칸 개수)를 계산한다."""
+        """표를 훑어 (사진 칸 기준 높이, 남은 사진 칸 개수)를 계산한다."""
         sizes = self.ctrl.scan_cells()
         if not sizes:
             raise HwpError("커서가 표 안에 있지 않습니다.\n"
-                           "한글에서 사진을 넣을 칸을 클릭한 뒤 다시 시도해 주세요.")
+                           "한글 문서에서 사진을 넣을 칸을 클릭한 뒤 다시 시도해 주세요.")
         if self.var_mode.get() == "all":
             thr = 0
         elif self.var_min_h.get() > 0:
@@ -577,6 +747,8 @@ class App(tk.Tk):
             t = split_threshold([h for _, h in sizes])
             thr = int(t) if t else 0
         available = sum(1 for _, h in sizes if h >= thr)
+        self.log(f"표 확인: 남은 칸 {len(sizes)}개, 사진 칸 {available}개, "
+                 f"기준 {thr / HWPUNIT_PER_MM:.0f}mm")
         return thr, available
 
     def _caption_for(self, item):
@@ -588,17 +760,13 @@ class App(tk.Tk):
             return os.path.splitext(os.path.basename(item["path"]))[0]
         return ""
 
+    @guarded
     def on_check_table(self):
-        """커서 위치부터 표를 훑어 감지 결과를 보여준다."""
         if not self.ctrl.connected:
-            messagebox.showwarning("안내", "먼저 [한글 연결]을 눌러주세요.")
+            messagebox.showinfo("안내", "먼저 [한글 연결]을 눌러주세요.", parent=self)
             return
-        try:
-            sizes = self.ctrl.scan_cells()
-            thr, available = self._plan()
-        except HwpError as e:
-            messagebox.showwarning("안내", str(e))
-            return
+        sizes = self.ctrl.scan_cells()
+        thr, available = self._plan()
         heights = sorted({round(h / HWPUNIT_PER_MM) for _, h in sizes})
         remaining = len(self.photos) - self.cursor
         verdict = ""
@@ -606,8 +774,7 @@ class App(tk.Tk):
             if available >= remaining:
                 verdict = f"\n\n넣을 사진 {remaining}장 → 칸이 충분합니다."
             else:
-                verdict = (f"\n\n넣을 사진 {remaining}장 → 칸이 {remaining - available}개 부족합니다.\n"
-                           f"표(페이지)를 더 만들어 두거나, 나눠서 넣으셔야 합니다.")
+                verdict = (f"\n\n넣을 사진 {remaining}장 → 칸이 {remaining - available}개 부족합니다.")
         messagebox.showinfo(
             "표 구조 확인",
             f"커서 위치부터 남은 칸 : {len(sizes)}개\n"
@@ -615,97 +782,95 @@ class App(tk.Tk):
             f"기준 높이 : {thr / HWPUNIT_PER_MM:.0f}mm\n"
             f"칸 높이 종류 : {heights}mm"
             f"{verdict}\n\n"
-            "결과가 맞지 않으면 [사진 칸 최소 높이]를 직접 지정해 보세요.")
+            "결과가 맞지 않으면 [사진 칸 최소 높이]를 직접 지정해 보세요.",
+            parent=self)
 
+    @guarded
     def on_reset_cursor(self):
         self.cursor = 0
         self._refresh()
+        self.log("넣을 위치를 목록 처음으로 되돌렸습니다.")
 
     def _ready(self) -> bool:
         if not self.ctrl.connected:
-            messagebox.showwarning("안내", "먼저 [한글 연결]을 눌러주세요.")
+            messagebox.showinfo("안내", "먼저 [한글 연결]을 눌러주세요.", parent=self)
             return False
         if not self.photos:
-            messagebox.showwarning("안내", "사진 목록이 비어 있습니다.")
+            messagebox.showinfo("안내", "사진 목록이 비어 있습니다.", parent=self)
             return False
         if self.cursor >= len(self.photos):
-            messagebox.showinfo("안내", "모든 사진을 넣었습니다.")
+            messagebox.showinfo("안내", "목록의 사진을 모두 넣었습니다.", parent=self)
             return False
         return True
 
-    def on_insert_one(self):
-        """현재 칸에 한 장 넣고, 다음 사진 칸까지 커서를 옮긴다."""
-        if not self._ready():
-            return
-        margins, border = self._options()
-        try:
-            thr, _ = self._plan()
-            item = self.photos[self.cursor]
-            self.ctrl.insert_picture_fit(item["path"], margins, border)
-            self.cursor += 1
-            caption = self._caption_for(item)
-            self._advance(thr, caption)
-        except HwpError as e:
-            messagebox.showwarning("삽입 실패", str(e))
-        except Exception as e:
-            messagebox.showerror("오류", f"삽입 중 오류가 발생했습니다.\n\n{e}")
-        self._refresh()
-
     def _advance(self, thr: int, pending_caption: str) -> bool:
-        """다음 사진 칸까지 이동. 도중의 작은 칸에 캡션을 쓴다. 표 끝이면 False."""
+        """다음 사진 칸까지 이동하며 도중의 작은 칸에 캡션을 쓴다. 표 끝이면 False."""
         for _ in range(MAX_CELL_WALK):
             if not self.ctrl.run("TableRightCell"):
                 return False
             size = self.ctrl.cell_size()
             if size is None:
                 return False
-            if size[1] >= thr:      # 사진 칸 도착
+            if size[1] >= thr:
                 return True
-            if pending_caption:     # 캡션 칸
+            if pending_caption:
                 self.ctrl.insert_text(pending_caption)
                 pending_caption = ""
         return False
 
+    @guarded
+    def on_insert_one(self):
+        if not self._ready():
+            return
+        margins, border = self._options()
+        thr, _ = self._plan()
+        item = self.photos[self.cursor]
+        self.ctrl.insert_picture_fit(item["path"], margins, border)
+        self.cursor += 1
+        self.log(f"삽입: {os.path.basename(item['path'])}")
+        self._advance(thr, self._caption_for(item))
+        self._refresh()
+
+    @guarded
     def on_insert_all(self):
         if not self._ready():
             return
         margins, border = self._options()
+        thr, available = self._plan()
+        remaining = len(self.photos) - self.cursor
+        if available < remaining:
+            go = messagebox.askyesno(
+                "칸이 부족합니다",
+                f"이 표에 남은 사진 칸 : {available}개\n"
+                f"넣어야 할 사진 : {remaining}장\n"
+                f"→ {remaining - available}장이 들어가지 못합니다.\n\n"
+                "칸이 찰 때까지만 채우고 멈춥니다.\n"
+                "남은 사진은 목록에 남으니, 페이지를 추가한 뒤\n"
+                "다음 표의 첫 칸을 클릭하고 다시 누르면 이어집니다.\n\n"
+                "이대로 진행할까요?", parent=self)
+            if not go:
+                self.log("사용자가 삽입을 취소했습니다.")
+                return
+
         inserted = 0
-        try:
-            thr, available = self._plan()
-            remaining = len(self.photos) - self.cursor
-            if available < remaining:
-                go = messagebox.askyesno(
-                    "칸이 부족합니다",
-                    f"이 표에 남은 사진 칸 : {available}개\n"
-                    f"넣어야 할 사진 : {remaining}장\n"
-                    f"→ {remaining - available}장이 들어가지 못합니다.\n\n"
-                    "지금 넣으면 칸이 찰 때까지만 채우고 멈춥니다.\n"
-                    "남은 사진은 목록에 그대로 남으니, 페이지를 추가한 뒤\n"
-                    "다음 표의 첫 칸을 클릭하고 다시 누르면 이어집니다.\n\n"
-                    "이대로 진행할까요?")
-                if not go:
-                    return
-            while self.cursor < len(self.photos):
-                item = self.photos[self.cursor]
-                self.ctrl.insert_picture_fit(item["path"], margins, border)
-                self.cursor += 1
-                inserted += 1
-                is_last = self.cursor >= len(self.photos)
-                moved = self._advance(thr, self._caption_for(item))
-                if is_last:
-                    break
-                if not moved:
-                    messagebox.showinfo(
-                        "표 끝에 도달",
-                        f"{inserted}장을 넣고 표가 끝났습니다.\n"
-                        f"다음 표의 첫 사진 칸에 커서를 놓고 다시 [한번에 넣기]를 누르세요.\n"
-                        f"(남은 사진 {len(self.photos) - self.cursor}장)")
-                    break
-        except HwpError as e:
-            messagebox.showwarning("삽입 중단", str(e))
-        except Exception as e:
-            messagebox.showerror("오류", f"삽입 중 오류가 발생했습니다.\n\n{e}")
+        while self.cursor < len(self.photos):
+            item = self.photos[self.cursor]
+            self.ctrl.insert_picture_fit(item["path"], margins, border)
+            self.cursor += 1
+            inserted += 1
+            self.log(f"삽입 {inserted}: {os.path.basename(item['path'])}")
+            is_last = self.cursor >= len(self.photos)
+            moved = self._advance(thr, self._caption_for(item))
+            if is_last:
+                break
+            if not moved:
+                messagebox.showinfo(
+                    "표 끝에 도달",
+                    f"{inserted}장을 넣고 표가 끝났습니다.\n"
+                    f"다음 표의 첫 사진 칸을 클릭하고 다시 [한번에 넣기]를 누르세요.\n"
+                    f"(남은 사진 {len(self.photos) - self.cursor}장)", parent=self)
+                break
+        self.log(f"완료: 이번에 {inserted}장 삽입")
         self._refresh()
 
     def on_close(self):
@@ -714,5 +879,26 @@ class App(tk.Tk):
         self.destroy()
 
 
+def main():
+    app = App()
+
+    def excepthook(exc_type, exc, tb):
+        text = "".join(traceback.format_exception(exc_type, exc, tb))
+        try:
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(f"\n===== {datetime.now():%Y-%m-%d %H:%M:%S} =====\n{text}\n")
+        except Exception:
+            pass
+        try:
+            messagebox.showerror("예기치 못한 오류",
+                                 f"{exc}\n\n기록: {LOG_FILE}", parent=app)
+        except Exception:
+            pass
+
+    sys.excepthook = excepthook
+    app.report_callback_exception = lambda *a: excepthook(*a)
+    app.mainloop()
+
+
 if __name__ == "__main__":
-    App().mainloop()
+    main()
