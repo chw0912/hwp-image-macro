@@ -192,6 +192,19 @@ class HwpController:
             return False
 
     # ---------------- 커서 상태 ----------------
+    def undo(self, times: int = 1) -> int:
+        """한글의 되돌리기를 지정한 횟수만큼 실행한다."""
+        self._require()
+        self.escape_selection()
+        done = 0
+        for _ in range(max(times, 0)):
+            before = self.get_pos()
+            self.run("Undo")
+            done += 1
+            if before is not None and self.get_pos() == before and done > 1:
+                pass  # 위치가 안 바뀌어도 되돌려진 경우가 있어 멈추지는 않는다
+        return done
+
     def get_pos(self):
         """현재 캐럿 위치 (list, para, pos). 실패하면 None."""
         self._require()
@@ -219,11 +232,25 @@ class HwpController:
             pass
 
     def move_cell(self, action: str) -> bool:
-        """칸 이동. 한 번 실패하면 선택을 풀고 다시 시도한다."""
-        if self.run(action):
-            return True
-        self.escape_selection()
-        return self.run(action)
+        """칸 이동. 실제로 커서가 움직였는지로 성공을 판정한다.
+
+        hwp.Run() 은 동작이 성공해도 False 를 돌려주는 경우가 있어
+        반환값을 믿으면 첫 칸에서 바로 멈춰버린다.
+        GetPos() 는 칸마다 다른 list 번호를 주므로 이동 여부를 확실히 알 수 있다."""
+        before = self.get_pos()
+        self.run(action)
+        after = self.get_pos()
+
+        if before is not None and after is not None:
+            if after != before:
+                return True
+            # 한 번 실패하면 개체 선택을 풀고 다시 시도
+            self.escape_selection()
+            self.run(action)
+            return self.get_pos() != before
+
+        # GetPos 를 못 쓰는 환경이면 칸 안에 있는지로 대신 판단
+        return self.cell_size() is not None
 
     # ---------------- 표 훑기 ----------------
     def scan_cells(self):
@@ -564,7 +591,17 @@ class App(tk.Tk):
         ttk.Button(act, text="한 장 넣기  (Ctrl+Q)", command=self.on_insert_one).pack(fill="x", pady=2)
         ttk.Button(act, text="한번에 넣기  (Ctrl+Shift+A)", command=self.on_insert_all).pack(fill="x", pady=2)
         ttk.Button(act, text="표 구조 확인", command=self.on_check_table).pack(fill="x", pady=2)
+        ttk.Button(act, text="칸 이동 진단", command=self.on_diagnose_move).pack(fill="x", pady=2)
         ttk.Button(act, text="넣을 위치 처음으로", command=self.on_reset_cursor).pack(fill="x", pady=2)
+
+        undo = ttk.LabelFrame(right, text="되돌리기", padding=8)
+        undo.pack(fill="x", pady=(8, 0))
+        ttk.Label(undo, text="횟수").grid(row=0, column=0, sticky="w")
+        self.var_undo_n = tk.IntVar(value=10)
+        ttk.Spinbox(undo, from_=1, to=200, increment=1, width=6,
+                    textvariable=self.var_undo_n).grid(row=0, column=1, sticky="e")
+        ttk.Button(undo, text="한글 되돌리기 실행", command=self.on_undo)\
+            .grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
 
         self.lbl_progress = ttk.Label(right, text="", foreground="#555", wraplength=250)
         self.lbl_progress.pack(fill="x")
@@ -847,6 +884,39 @@ class App(tk.Tk):
             f"{verdict}\n\n"
             "결과가 맞지 않으면 [사진 칸 최소 높이]를 직접 지정해 보세요.",
             parent=self)
+
+    @guarded
+    def on_diagnose_move(self):
+        """칸 이동이 왜 안 되는지 원인을 좁히기 위한 진단."""
+        if not self.ctrl.connected:
+            messagebox.showinfo("안내", "먼저 [한글 연결]을 눌러주세요.", parent=self)
+            return
+        lines = []
+        start = self.ctrl.get_pos()
+        lines.append(f"GetPos 사용 가능 : {'예' if start else '아니오'}")
+        lines.append(f"시작 위치        : {start}")
+        lines.append(f"표 안 여부       : {'예' if self.ctrl.in_table() else '아니오'}")
+
+        raw = self.ctrl.run("TableRightCell")
+        after = self.ctrl.get_pos()
+        lines.append(f"Run 반환값       : {raw}")
+        lines.append(f"이동 후 위치     : {after}")
+        lines.append(f"실제로 움직였나  : {'예' if after != start else '아니오'}")
+
+        if start:
+            self.ctrl.set_pos(start)
+        text = "\n".join(lines)
+        self.log("칸 이동 진단\n" + text)
+        messagebox.showinfo("칸 이동 진단", text, parent=self)
+
+    @guarded
+    def on_undo(self):
+        if not self.ctrl.connected:
+            messagebox.showinfo("안내", "먼저 [한글 연결]을 눌러주세요.", parent=self)
+            return
+        n = self.var_undo_n.get()
+        done = self.ctrl.undo(n)
+        self.log(f"되돌리기 {done}회 실행")
 
     @guarded
     def on_reset_cursor(self):
