@@ -9,8 +9,8 @@
   2) [한글 연결] 후, 작업 대상이 그 문서가 아니면 [문서 열기] 로 지정
   3) 사진을 목록에 담는다
   4) 한글에서 사진을 넣을 칸들을 드래그로 선택
-  5) Ctrl+Shift+A  →  선택한 칸에 목록 순서대로 삽입
-     (칸 하나씩 넣으려면 칸을 클릭하고 Ctrl+Q)
+  5) [감지된 칸에 넣기] — 목록 순서대로 삽입
+     (칸 하나씩 넣으려면 칸을 클릭하고 [커서 칸에 한 장])
 
 필요 환경 : Windows + 한글(HWP) 설치
 설치      : pip install -r requirements.txt
@@ -18,16 +18,12 @@
 """
 from __future__ import annotations
 
-import ctypes
 import functools
 import os
 import re
 import sys
-import threading
-import time
 import tkinter as tk
 import traceback
-from ctypes import wintypes
 from datetime import datetime
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
@@ -229,9 +225,11 @@ class HwpController:
     def _set_field_name(self, name: str, option: int = 0) -> bool:
         """현재 위치(또는 셀 블록 전체)에 셀필드 이름을 붙인다.
 
-        option 값이 셀 블록 전체에 적용할지 현재 칸만 적용할지를
-        가르는 것으로 보인다. 환경마다 다를 수 있어 밖에서 지정한다."""
-        for args in ((name, option, "", ""), (name, option), (name,)):
+        인자 순서는 (필드명, 안내문, 메모, 옵션) 이다.
+        예전에 두 번째 자리에 옵션 숫자를 넣었더니 안내문 자리로 들어가
+        선택 영역 전체가 아니라 커서가 있는 칸 하나에만 이름이 붙었다.
+        실제 예제들은 이름 하나만 넘기므로 그 형태를 먼저 시도한다."""
+        for args in ((name,), (name, "", "", option), (name, "", ""), (name, option)):
             try:
                 self.hwp.SetCurFieldName(*args)
                 return True
@@ -276,6 +274,9 @@ class HwpController:
         self._require()
         if not self._set_field_name(name, option):
             return []
+        # 예제들이 이름을 붙인 직후 Cancel 로 셀 블록을 푼다. 그래야
+        # 이어지는 MoveToField 가 제대로 동작한다.
+        self.escape_selection()
         count = self._count_field(name)
         if count == 0:
             return []
@@ -287,6 +288,13 @@ class HwpController:
                     ids.append(int(p[0]))
         self._clear_field_name(name)
         return ids
+
+    def selection_mode(self):
+        """0이 아니면 무언가 선택된 상태. 셀 블록도 여기에 잡힌다."""
+        try:
+            return int(self.hwp.SelectionMode)
+        except Exception:
+            return None
 
     def selection_probe(self, option: int = 0):
         """선택 영역을 읽는 방법들의 결과를 그대로 모은다 (진단용)."""
@@ -400,49 +408,6 @@ class HwpController:
 # ==================================================================
 #  전역 단축키
 # ==================================================================
-WM_HOTKEY = 0x0312
-MOD_CONTROL, MOD_SHIFT = 0x0002, 0x0004
-
-
-class GlobalHotkeys(threading.Thread):
-    def __init__(self, bindings):
-        super().__init__(daemon=True)
-        self.bindings = bindings
-        self._stop = threading.Event()
-
-    def run(self):
-        try:
-            user32 = ctypes.windll.user32
-        except Exception:
-            return
-        registered = []
-        for hk_id, (mods, vk, _) in self.bindings.items():
-            try:
-                if user32.RegisterHotKey(None, hk_id, mods, vk):
-                    registered.append(hk_id)
-            except Exception:
-                pass
-        msg = wintypes.MSG()
-        while not self._stop.is_set():
-            try:
-                if user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1):
-                    if msg.message == WM_HOTKEY:
-                        b = self.bindings.get(msg.wParam)
-                        if b:
-                            b[2]()
-            except Exception:
-                pass
-            time.sleep(0.03)
-        for hk_id in registered:
-            try:
-                user32.UnregisterHotKey(None, hk_id)
-            except Exception:
-                pass
-
-    def stop(self):
-        self._stop.set()
-
-
 # ==================================================================
 #  오류를 눈에 보이게 만드는 장치
 # ==================================================================
@@ -480,8 +445,7 @@ class App(tk.Tk):
         self._thumb = None
 
         self._build_ui()
-        self._bind_keys()
-        self._start_hotkeys()
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
         self._refresh()
         self.log("프로그램을 시작했습니다.")
         if Image is None:
@@ -568,11 +532,11 @@ class App(tk.Tk):
 
         act = ttk.LabelFrame(right, text="삽입", padding=8)
         act.pack(fill="x")
-        ttk.Button(act, text="선택한 칸에 넣기  (Ctrl+Shift+A)",
+        ttk.Button(act, text="선택한 칸에 넣기",
                    command=self.on_insert_selection).pack(fill="x", pady=2)
         ttk.Label(act, text="한글에서 칸들을 드래그로 선택한 뒤 누르세요",
                   foreground="#666", wraplength=225).pack(anchor="w")
-        ttk.Button(act, text="커서 칸에 한 장  (Ctrl+Q)",
+        ttk.Button(act, text="커서 칸에 한 장",
                    command=self.on_insert_one).pack(fill="x", pady=(8, 2))
         ttk.Button(act, text="넣을 위치 처음으로",
                    command=self.on_reset_cursor).pack(fill="x", pady=2)
@@ -613,33 +577,14 @@ class App(tk.Tk):
         self.var_field_option = tk.IntVar(value=0)
         ttk.Spinbox(row, from_=0, to=7, increment=1, width=5,
                     textvariable=self.var_field_option).pack(side="right")
-        ttk.Label(diag, text="선택한 칸이 1개로만 잡히면 0→1→2→3 으로 바꿔가며 시험",
+        ttk.Label(diag, text="보통 0 으로 둡니다. 칸이 1개로만 잡힐 때만 바꿔 시험",
                   foreground="#666", wraplength=225).pack(anchor="w", pady=(2, 4))
         ttk.Button(diag, text="선택 영역 확인",
                    command=self.on_check_selection).pack(fill="x", pady=2)
         ttk.Button(diag, text="커서 위치 확인",
                    command=self.on_check_cursor).pack(fill="x", pady=2)
 
-    def _bind_keys(self):
-        self.bind("<Control-q>", lambda e: self.on_insert_one())
-        self.bind("<Control-Shift-A>", lambda e: self.on_insert_selection())
-        self.protocol("WM_DELETE_WINDOW", self.on_close)
-
-    def _start_hotkeys(self):
-        self.hotkeys = None
-        if sys.platform != "win32":
-            return
-        try:
-            self.hotkeys = GlobalHotkeys({
-                1: (MOD_CONTROL, ord("Q"), lambda: self.after(0, self.on_insert_one)),
-                2: (MOD_CONTROL | MOD_SHIFT, ord("A"),
-                    lambda: self.after(0, self.on_insert_selection)),
-            })
-            self.hotkeys.start()
-        except Exception:
-            self.hotkeys = None
-
-    # ---------------- 사진 목록 ----------------
+    # ---------------- 선택 영역 감시 ----------------
     def _refresh(self):
         for iid in self.tree.get_children():
             self.tree.delete(iid)
@@ -867,9 +812,8 @@ class App(tk.Tk):
             messagebox.showinfo(
                 "칸을 선택해 주세요",
                 "선택된 칸을 찾지 못했습니다.\n\n"
-                "한글 창을 보고 있는 상태에서 사진을 넣을 칸들을\n"
-                "드래그로 선택한 뒤 Ctrl+Shift+A 를 눌러주세요.\n\n"
-                "한 장씩 넣으시려면 칸을 클릭하고 Ctrl+Q 를 쓰시면 됩니다.",
+                "한글에서 사진을 넣을 칸들을 드래그로 선택한 뒤\n"
+                "다시 이 버튼을 눌러주세요.",
                 parent=self)
             return
 
@@ -881,11 +825,9 @@ class App(tk.Tk):
         if len(cells) == 1 and remaining > 1:
             if not messagebox.askyesno(
                     "칸이 1개로만 잡혔습니다",
-                    "여러 칸을 선택하셨다면 두 가지를 확인해 주세요.\n\n"
-                    "1. 프로그램 창의 버튼을 클릭하면 한글의 선택이 풀립니다.\n"
-                    "   한글 창을 보고 있는 상태에서 Ctrl+Shift+A 를 누르세요.\n\n"
-                    "2. 그래도 1개면 [진단]의 셀필드 option 을\n"
-                    "   1, 2, 3 으로 바꿔가며 다시 시도해 보세요.\n\n"
+                    "여러 칸을 선택하셨다면 [진단]의 셀필드 option 을\n"
+                    "0 → 1 → 2 → 3 으로 바꿔가며 다시 드래그해 보세요.\n"
+                    "드래그할 때마다 [감지된 칸] 숫자가 갱신됩니다.\n\n"
                     "이대로 1장만 넣을까요?", parent=self):
                 self.log("사용자가 삽입을 취소했습니다.")
                 return
@@ -944,10 +886,6 @@ class App(tk.Tk):
             "위치가 바뀌지 않으면 프로그램이 보는 한글 창이\n"
             "지금 클릭하는 창과 다른 것입니다.", parent=self)
 
-    def on_close(self):
-        if self.hotkeys:
-            self.hotkeys.stop()
-        self.destroy()
 
 
 def main():
