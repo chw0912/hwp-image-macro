@@ -229,7 +229,9 @@ class HwpController:
         예전에 두 번째 자리에 옵션 숫자를 넣었더니 안내문 자리로 들어가
         선택 영역 전체가 아니라 커서가 있는 칸 하나에만 이름이 붙었다.
         실제 예제들은 이름 하나만 넘기므로 그 형태를 먼저 시도한다."""
-        for args in ((name,), (name, "", "", option), (name, "", ""), (name, option)):
+        # 공식 시그니처: SetCurFieldName(fieldname, option, direction, memo)
+        # hwpFieldCell = 1 이므로 셀필드는 option=1 이 맞다.
+        for args in ((name, option, "", ""), (name, option), (name,)):
             try:
                 self.hwp.SetCurFieldName(*args)
                 return True
@@ -264,7 +266,7 @@ class HwpController:
             if not self._set_field_name(""):
                 break
 
-    def selected_cells(self, name: str = FIELD_TAG, option: int = 0):
+    def selected_cells(self, name: str = FIELD_TAG, option: int = 1):
         """드래그로 선택한 칸들의 번호를 순서대로 돌려준다.
 
         셀 블록 상태에서 SetCurFieldName 을 실행하면 선택된 모든 칸에
@@ -379,11 +381,50 @@ class HwpController:
         return out
 
     def selection_mode(self):
-        """0이 아니면 무언가 선택된 상태. 셀 블록도 여기에 잡힌다."""
+        """0이 아니면 무언가 선택된 상태.
+
+        공식 매뉴얼: F3/F4 로 지정된 블록은 HWPSEL_STRICT_MODE(0x10)가
+        OR 마스크되어 오므로 0x0F 로 AND 마스크해서 판단해야 한다.
+        마스크한 값 3이 셀 블록. (19 & 15 = 3)"""
         try:
             return int(self.hwp.SelectionMode)
         except Exception:
             return None
+
+    def selection_mode_masked(self):
+        raw = self.selection_mode()
+        return None if raw is None else raw & 0x0F
+
+    def field_probe(self):
+        """공식 매뉴얼의 옵션 상수로 필드 동작을 시험한다.
+
+        hwpFieldCell=1, hwpFieldClickHere=2, hwpFieldSelection=4
+        지금까지 option 을 0으로만 넣어서 셀 블록 전체에 적용되지
+        않았을 가능성이 있다."""
+        self._require()
+        out = {}
+
+        # (1) 선택 영역 안의 필드만 조회 — 문서를 건드리지 않는다
+        for opt in (4, 5, 1, 0):
+            try:
+                raw = self.hwp.GetFieldList(1, opt)
+                text = str(raw) if raw else ""
+                items = [x for x in re.split(r"[\x02\r\n]+", text) if x]
+                out[f"GetFieldList(1,{opt})"] = f"{len(items)}개 {items[:10]}"
+            except Exception as e:
+                out[f"GetFieldList(1,{opt})"] = f"실패: {e}"
+
+        # (2) option=1 로 셀 블록 전체에 이름이 붙는지 — 선택을 소모한다
+        name = FIELD_TAG + "_opt"
+        try:
+            ok = self.hwp.SetCurFieldName(name, 1, "", "")
+            n = self._count_field(name)
+            out["SetCurFieldName(option=1)"] = f"성공={ok}, 이름 붙은 칸={n}"
+            self.escape_selection()
+            self._clear_field_name(name)
+        except Exception as e:
+            out["SetCurFieldName(option=1)"] = f"실패: {e}"
+        return out
 
     def selection_probe(self, option: int = 0):
         """선택 영역을 읽는 방법들의 결과를 그대로 모은다 (진단용).
@@ -393,7 +434,8 @@ class HwpController:
         report = {}
 
         # (1) 선택을 건드리지 않는 검사
-        report["SelectionMode"] = self.selection_mode()
+        raw_mode = self.selection_mode()
+        report["SelectionMode"] = f"{raw_mode} (0x0F 마스크 → {self.selection_mode_masked()}, 3이면 셀블록)"
         report["GetPos"] = self.get_pos()
         report["표 안 여부"] = self.in_table()
         try:
@@ -412,11 +454,15 @@ class HwpController:
         except Exception as e:
             report["블록 텍스트"] = f"실패: {e}"
 
-        # (2) 여기서부터는 선택이 사라진다
+        # (2) 공식 매뉴얼 옵션 상수로 시험 — 마지막 항목이 선택을 소모한다
         try:
-            report["필드 붙인 결과"] = self._probe_field_count()
+            report.update(self.field_probe())
         except Exception as e:
-            report["필드 붙인 결과"] = f"실패: {e}"
+            report["필드 시험"] = f"실패: {e}"
+        try:
+            report["필드 붙인 결과(option=0)"] = self._probe_field_count()
+        except Exception as e:
+            report["필드 붙인 결과(option=0)"] = f"실패: {e}"
 
         report["열린 문서"] = self.documents()
         return report
@@ -678,7 +724,7 @@ class App(tk.Tk):
         row = ttk.Frame(diag)
         row.pack(fill="x")
         ttk.Label(row, text="셀필드 option").pack(side="left")
-        self.var_field_option = tk.IntVar(value=0)
+        self.var_field_option = tk.IntVar(value=1)
         ttk.Spinbox(row, from_=0, to=7, increment=1, width=5,
                     textvariable=self.var_field_option).pack(side="right")
         ttk.Label(diag, text="보통 0 으로 둡니다. 칸이 1개로만 잡힐 때만 바꿔 시험",
