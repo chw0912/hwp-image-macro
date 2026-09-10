@@ -581,23 +581,33 @@ class HwpController:
         if not inserted:
             hwp.InsertPicture(path, True)
 
-        if post_adjust or border_px > 0:
-            self._apply_shape(w, h, border_px)
+        # InsertPicture 의 sizeoption 은 넘긴 width/height 를 무시하고
+        # 한글이 비율을 유지해 스스로 계산한다. (실측: 요청 21.1x18.4mm →
+        # 실제 14.8x19.4mm) 그래서 삽입 뒤 크기를 다시 강제로 지정한다.
+        need_resize = (not keep_ratio) or post_adjust or border_px > 0
+        applied = self._apply_shape(w, h, border_px) if need_resize else None
 
         # 그림이 선택된 채로 남으면 다음 동작이 막힌다
         self.escape_selection()
-        return (cw, ch), (w, h)
+        return (cw, ch), (w, h), applied
 
     def _apply_shape(self, w: int, h: int, border_px: int):
         """삽입한 그림의 크기와 테두리를 다시 지정한다.
 
-        지정하지 않은 속성까지 기본값으로 함께 적용되므로,
-        그림이 선택되지 않거나 배치가 이상해지면 이 단계를 꺼야 한다."""
+        개체 속성 대화상자의 '너비 고정값 / 높이 고정값' 을 직접 쓰는 것과
+        같은 동작이다. WidthRelTo / HeightRelTo 를 0(절대값)으로 두어야
+        지정한 값이 그대로 적용된다."""
         hwp = self.hwp
+        applied = None
         try:
             hwp.FindCtrl()
             hwp.HAction.GetDefault("ShapeObjDialog", hwp.HParameterSet.HShapeObject.HSet)
             so = hwp.HParameterSet.HShapeObject
+            for key, val in (("WidthRelTo", 0), ("HeightRelTo", 0)):
+                try:
+                    setattr(so, key, val)
+                except Exception:
+                    pass
             so.Width = w
             so.Height = h
             so.TreatAsChar = 1
@@ -614,10 +624,15 @@ class HwpController:
                 except Exception:
                     pass
             hwp.HAction.Execute("ShapeObjDialog", so.HSet)
+            try:
+                applied = (int(so.Width), int(so.Height))
+            except Exception:
+                applied = None
         except Exception:
             pass
         finally:
             hwp.Run("Cancel")
+        return applied
 
 
 # ==================================================================
@@ -1021,11 +1036,12 @@ class App(tk.Tk):
             return
         margins, border = self._insert_options()
         path = self.photos[self.cursor]
-        cell, pic = self.ctrl.insert_picture_fit(
+        cell, pic, applied = self.ctrl.insert_picture_fit(
             path, margins, border, post_adjust=self.var_post_adjust.get(),
-                keep_ratio=self.var_keep_ratio.get())
+            keep_ratio=self.var_keep_ratio.get())
         self.cursor += 1
-        self.log(f"삽입: {os.path.basename(path)} — 칸 {self._mm(cell)}, 사진 {self._mm(pic)}")
+        self.log(f"삽입: {os.path.basename(path)} — 칸 {self._mm(cell)}, "
+                 f"요청 {self._mm(pic)}, 적용 {self._mm(applied) if applied else '확인불가'}")
         self._refresh()
 
     @guarded
@@ -1074,13 +1090,13 @@ class App(tk.Tk):
                 self.log(f"칸 {lid} 로 이동하지 못해 건너뜁니다.")
                 continue
             path = self.photos[self.cursor]
-            cell, pic = self.ctrl.insert_picture_fit(
+            cell, pic, applied = self.ctrl.insert_picture_fit(
                 path, margins, border, post_adjust=self.var_post_adjust.get(),
                 keep_ratio=self.var_keep_ratio.get())
             self.cursor += 1
             inserted += 1
-            self.log(f"삽입 {inserted}: {os.path.basename(path)} — "
-                     f"칸 {self._mm(cell)}, 사진 {self._mm(pic)}")
+            self.log(f"삽입 {inserted}: {os.path.basename(path)} — 칸 {self._mm(cell)}, "
+                     f"요청 {self._mm(pic)}, 적용 {self._mm(applied) if applied else '확인불가'}")
         self.log(f"완료: 이번에 {inserted}장 삽입")
         self._refresh()
 
