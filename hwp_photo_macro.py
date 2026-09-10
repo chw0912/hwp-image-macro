@@ -35,7 +35,6 @@ except ImportError:
 
 # 한글 내부 단위
 HWPUNIT_PER_MM = 283.465
-HWPUNIT_PER_PX = 75          # 96dpi 기준: 1inch = 7200 HWPUNIT = 96px
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tif", ".tiff", ".webp")
 MAX_CELLS = 400              # 무한 루프 방지용 상한
 FIELD_TAG = "__img_macro_target__"
@@ -536,10 +535,10 @@ class HwpController:
         except Exception:
             return 4, 3
 
-    def insert_picture_fit(self, path: str, margins_px=(0, 0, 0, 0),
-                           border_px=0, post_adjust: bool = False,
-                           keep_ratio: bool = False):
-        """칸 크기에 맞춰 삽입. margins_px = (상, 하, 좌, 우) 픽셀
+    def insert_picture_fit(self, path: str, margins_mm=(0, 0, 0, 0),
+                           border_mm=0.0, post_adjust: bool = False,
+                           keep_ratio: bool = True):
+        """칸 크기에 맞춰 삽입. margins_mm = (상, 하, 좌, 우) 밀리미터
 
         keep_ratio=True  : 비율을 유지해 칸에 들어가는 최대 크기.
                            세로로 긴 사진은 좌우에 공백이 남는다.
@@ -553,7 +552,7 @@ class HwpController:
                            "한글에서 사진을 넣을 칸을 클릭한 뒤 다시 시도해 주세요.")
 
         cw, ch = size
-        top, bottom, left, right = (int(m * HWPUNIT_PER_PX) for m in margins_px)
+        top, bottom, left, right = (int(m * HWPUNIT_PER_MM) for m in margins_mm)
         avail_w = max(cw - left - right, 1)
         avail_h = max(ch - top - bottom, 1)
 
@@ -582,16 +581,49 @@ class HwpController:
             hwp.InsertPicture(path, True)
 
         # InsertPicture 의 sizeoption 은 넘긴 width/height 를 무시하고
-        # 한글이 비율을 유지해 스스로 계산한다. (실측: 요청 21.1x18.4mm →
-        # 실제 14.8x19.4mm) 그래서 삽입 뒤 크기를 다시 강제로 지정한다.
-        need_resize = (not keep_ratio) or post_adjust or border_px > 0
-        applied = self._apply_shape(w, h, border_px) if need_resize else None
+        # 한글이 비율을 유지해 스스로 계산한다. 삽입 후 크기를 강제로
+        # 지정해봤으나 사진이 잘려서, 기본 동작에서는 쓰지 않는다.
+        # InsertPicture 의 sizeoption 은 넘긴 width/height 를 무시하고
+        # 한글이 스스로 계산한다. 그래서 삽입 후 개체 크기를 직접 잡는다.
+        applied = self._resize_ctrl(w, h)
+        if applied is None and (post_adjust or border_mm > 0):
+            applied = self._apply_shape(w, h, border_mm)
+        elif border_mm > 0 or post_adjust:
+            self._apply_shape(w, h, border_mm)
 
         # 그림이 선택된 채로 남으면 다음 동작이 막힌다
         self.escape_selection()
         return (cw, ch), (w, h), applied
 
-    def _apply_shape(self, w: int, h: int, border_px: int):
+    def _resize_ctrl(self, w: int, h: int):
+        """방금 삽입한 그림의 크기만 정확히 바꾼다.
+
+        ShapeObjDialog 는 지정하지 않은 속성까지 기본값으로 함께 적용해
+        배치나 개체 보호가 의도치 않게 바뀐다. 개체의 Properties 를
+        직접 수정하면 지정한 항목만 바뀐다."""
+        hwp = self.hwp
+        for getter in ("CurSelectedCtrl", "LastCtrl"):
+            try:
+                if getter == "CurSelectedCtrl":
+                    hwp.FindCtrl()
+                ctrl = getattr(hwp, getter)
+                if ctrl is None:
+                    continue
+                prop = ctrl.Properties
+                prop.SetItem("Width", int(w))
+                prop.SetItem("Height", int(h))
+                ctrl.Properties = prop
+                try:
+                    applied = (int(prop.Item("Width")), int(prop.Item("Height")))
+                except Exception:
+                    applied = (w, h)
+                hwp.Run("Cancel")
+                return applied
+            except Exception:
+                continue
+        return None
+
+    def _apply_shape(self, w: int, h: int, border_mm: float):
         """삽입한 그림의 크기와 테두리를 다시 지정한다.
 
         개체 속성 대화상자의 '너비 고정값 / 높이 고정값' 을 직접 쓰는 것과
@@ -616,11 +648,11 @@ class HwpController:
                     setattr(so, key, 0)
                 except Exception:
                     pass
-            if border_px > 0:
+            if border_mm > 0:
                 try:
                     so.LineShape.Type = 1
                     so.LineShape.Color = 0
-                    so.LineShape.Width = max(int(border_px * HWPUNIT_PER_PX), 1)
+                    so.LineShape.Width = max(int(border_mm * HWPUNIT_PER_MM), 1)
                 except Exception:
                     pass
             hwp.HAction.Execute("ShapeObjDialog", so.HSet)
@@ -773,38 +805,33 @@ class App(tk.Tk):
         self.lbl_progress = ttk.Label(act, text="", foreground="#555", wraplength=225)
         self.lbl_progress.pack(fill="x", pady=(4, 0))
 
-        opt = ttk.LabelFrame(right, text="여백 주기 (px)", padding=8)
+        opt = ttk.LabelFrame(right, text="여백 주기 (mm)", padding=8)
         opt.pack(fill="x", pady=8)
         self.var_margin = {}
         for i, key in enumerate(("상", "하", "좌", "우")):
             ttk.Label(opt, text=key).grid(row=i, column=0, sticky="w", pady=1)
-            v = tk.IntVar(value=0)
+            v = tk.DoubleVar(value=0.0)
             self.var_margin[key] = v
-            ttk.Spinbox(opt, from_=0, to=300, increment=1, width=8,
+            ttk.Spinbox(opt, from_=0, to=50, increment=0.5, width=8,
                         textvariable=v).grid(row=i, column=1, sticky="e")
 
         bd = ttk.LabelFrame(right, text="사진 속성", padding=8)
         bd.pack(fill="x")
         self.var_border_on = tk.BooleanVar(value=False)
-        ttk.Checkbutton(bd, text="테두리 (px)", variable=self.var_border_on)\
+        ttk.Checkbutton(bd, text="테두리 (mm)", variable=self.var_border_on)\
             .grid(row=0, column=0, sticky="w")
-        self.var_border_px = tk.IntVar(value=1)
-        ttk.Spinbox(bd, from_=1, to=20, increment=1, width=6,
-                    textvariable=self.var_border_px).grid(row=0, column=1, sticky="e")
+        self.var_border_mm = tk.DoubleVar(value=0.2)
+        ttk.Spinbox(bd, from_=0.1, to=5.0, increment=0.1, width=6,
+                    textvariable=self.var_border_mm).grid(row=0, column=1, sticky="e")
         self.var_keep_ratio = tk.BooleanVar(value=False)
-        ttk.Checkbutton(bd, text="비율 유지 (여백 생김)", variable=self.var_keep_ratio)\
-            .grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
-        ttk.Label(bd, text="끄면 칸을 꽉 채웁니다. 사진이 늘어날 수 있습니다.",
-                  foreground="#666", wraplength=225)\
-            .grid(row=4, column=0, columnspan=2, sticky="w")
-
-        self.var_post_adjust = tk.BooleanVar(value=False)
-        ttk.Checkbutton(bd, text="삽입 후 크기 다시 지정",
-                        variable=self.var_post_adjust)\
+        ttk.Checkbutton(bd, text="비율 유지 (좌우 여백 생김)",
+                        variable=self.var_keep_ratio)\
             .grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
-        ttk.Label(bd, text="그림이 선택되지 않으면 꺼두세요",
+        ttk.Label(bd, text="끄면 칸을 꽉 채웁니다",
                   foreground="#666", wraplength=225)\
             .grid(row=2, column=0, columnspan=2, sticky="w")
+
+        self.var_post_adjust = tk.BooleanVar(value=False)
 
         diag = ttk.LabelFrame(right, text="진단", padding=8)
         diag.pack(fill="x", pady=(8, 0))
@@ -989,14 +1016,14 @@ class App(tk.Tk):
         return f"{w / HWPUNIT_PER_MM:.0f}x{h / HWPUNIT_PER_MM:.0f}mm"
 
     def _insert_options(self):
-        """삽입 옵션(여백/테두리)을 픽셀 단위로 돌려준다.
+        """삽입 옵션(여백/테두리)을 밀리미터 단위로 돌려준다.
 
         주의: 이 메서드 이름을 _options 로 두면 안 된다.
         tkinter.Misc._options 를 가려버려서 파일 대화상자와 메시지 창이
         전부 TypeError 로 죽는다."""
         m = self.var_margin
         margins = (m["상"].get(), m["하"].get(), m["좌"].get(), m["우"].get())
-        border = self.var_border_px.get() if self.var_border_on.get() else 0
+        border = self.var_border_mm.get() if self.var_border_on.get() else 0.0
         return margins, border
 
     def _check_saved(self) -> bool:
