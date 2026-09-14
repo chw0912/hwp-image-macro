@@ -6,14 +6,20 @@
 - 지원 형식: `.hwp`, `.hwpx`
 - 필요 환경: Windows, 한글(HWP) 설치
 
----
+<br>
 
 ## 실행 화면
 
-https://github.com/user-attachments/assets/7d22e8af-c5bf-4f37-a0f1-95e7cb0d92ed
+<p align="center">
+  <img width="800" height="468" alt="Image" src="https://github.com/user-attachments/assets/e1220241-b918-45a3-9f17-4c97a0b24f5c" />
+</p>
 
-한글에서 사진을 넣을 칸들을 드래그로 선택하고 **[선택한 칸에 넣기]** 를 누르면
-목록 순서대로 삽입됩니다.
+
+- 한글에서 칸을 드래그로 선택하고 <b>[선택한 칸에 넣기]</b> 를 누르면 목록 순서대로 삽입됩니다.</sub>
+
+
+<br>
+
 ---
 
 ## 1. 설치
